@@ -6,3 +6,4 @@
 #define ksu_ghost_debug(fmt, ...) pr_info("GhostDebug: " fmt, ##__VA_ARGS__)
 
 #endif
+EOF
