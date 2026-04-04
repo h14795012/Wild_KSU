@@ -764,6 +764,79 @@ static int add_try_umount(void __user *arg)
     return 0;
 }
 
+static int do_manage_pid_hide(void __user *arg)
+{
+    struct ksu_manage_pid_hide_cmd cmd;
+    extern void wksu_set_pid_hidden(int pid, bool hide);
+
+    if (copy_from_user(&cmd, arg, sizeof(cmd))) {
+        return -EFAULT;
+    }
+
+    wksu_set_pid_hidden(cmd.pid, cmd.hide);
+    return 0;
+}
+
+static int do_mem_rw(void __user *arg)
+{
+    struct ksu_mem_rw_cmd cmd;
+    struct task_struct *task;
+    void *page_buf;
+    int ret = 0;
+    extern bool wksu_is_pid_hidden(int pid);
+
+    if (copy_from_user(&cmd, arg, sizeof(cmd))) {
+        return -EFAULT;
+    }
+
+    // Scope restriction: Only allow reading/writing hidden processes
+    // This prevents the interface from being used as a generic memory reader
+    if (!wksu_is_pid_hidden(cmd.pid)) {
+        return -EACCES; 
+    }
+
+    task = find_get_task_by_vpid(cmd.pid);
+    if (!task) return -ESRCH;
+
+    page_buf = (void *)__get_free_page(GFP_KERNEL);
+    if (!page_buf) {
+        put_task_struct(task);
+        return -ENOMEM;
+    }
+
+    while (cmd.len > 0) {
+        size_t bytes = min_t(size_t, cmd.len, PAGE_SIZE);
+
+        if (cmd.write) {
+            if (copy_from_user(page_buf, (void __user *)cmd.buf, bytes)) {
+                ret = -EFAULT;
+                break;
+            }
+            if (access_process_vm(task, (unsigned long)cmd.addr, page_buf, bytes, FOLL_FORCE | FOLL_WRITE) != bytes) {
+                ret = -EIO;
+                break;
+            }
+        } else {
+            if (access_process_vm(task, (unsigned long)cmd.addr, page_buf, bytes, FOLL_FORCE) != bytes) {
+                ret = -EIO;
+                break;
+            }
+            if (copy_to_user((void __user *)cmd.buf, page_buf, bytes)) {
+                ret = -EFAULT;
+                break;
+            }
+        }
+
+        cmd.addr += bytes;
+        cmd.buf += bytes;
+        cmd.len -= bytes;
+    }
+
+    free_page((unsigned long)page_buf);
+    put_task_struct(task);
+    return ret;
+}
+
 // IOCTL handlers mapping table
 static const struct ksu_ioctl_cmd_map ksu_ioctl_handlers[] = {
     { .cmd = KSU_IOCTL_GRANT_ROOT,
@@ -846,6 +919,14 @@ static const struct ksu_ioctl_cmd_map ksu_ioctl_handlers[] = {
       .name = "ADD_TRY_UMOUNT",
       .handler = add_try_umount,
       .perm_check = manager_or_root },
+	{ .cmd = KSU_IOCTL_MANAGE_PID_HIDE,
+	  .name = "MANAGE_PID_HIDE",
+	  .handler = do_manage_pid_hide,
+	  .perm_check = manager_or_root },
+	{ .cmd = KSU_IOCTL_MEM_RW,
+	  .name = "MEM_RW",
+	  .handler = do_mem_rw,
+	  .perm_check = manager_or_root },
 	{ .cmd = KSU_IOCTL_GET_HOOK_MODE,
 	  .name = "GET_HOOK_MODE",
 	  .handler = do_get_hook_mode,

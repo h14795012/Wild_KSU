@@ -142,6 +142,19 @@ struct ksu_add_try_umount_cmd {
 #define KSU_UMOUNT_ADD 1 // add entry (path + flags)
 #define KSU_UMOUNT_DEL 2 // delete entry, strcmp
 
+struct ksu_manage_pid_hide_cmd {
+    __s32 pid;
+    __u8 hide; // 1 for hide, 0 for show
+};
+
+struct ksu_mem_rw_cmd {
+    __s32 pid;
+    __u64 addr;
+    __u64 buf; // user space buffer pointer
+    __u32 len;
+    __u8 write; // 1 for write, 0 for read
+};
+
 // IOCTL command definitions
 #define KSU_IOCTL_GRANT_ROOT _IOC(_IOC_NONE, 'K', 1, 0)
 #define KSU_IOCTL_GET_INFO _IOC(_IOC_READ, 'K', 2, 0)
@@ -167,6 +180,8 @@ struct ksu_add_try_umount_cmd {
 #define KSU_IOCTL_MANAGE_MARK _IOC(_IOC_READ | _IOC_WRITE, 'K', 16, 0)
 #define KSU_IOCTL_NUKE_EXT4_SYSFS _IOC(_IOC_WRITE, 'K', 17, 0)
 #define KSU_IOCTL_ADD_TRY_UMOUNT _IOC(_IOC_WRITE, 'K', 18, 0)
+#define KSU_IOCTL_MANAGE_PID_HIDE _IOW('K', 20, struct ksu_manage_pid_hide_cmd)
+#define KSU_IOCTL_MEM_RW _IOWR('K', 21, struct ksu_mem_rw_cmd)
 #define KSU_IOCTL_GET_HOOK_MODE _IOC(_IOC_READ, 'K', 98, 0)
 #define KSU_IOCTL_GET_VERSION_TAG _IOC(_IOC_READ, 'K', 99, 0)
 
