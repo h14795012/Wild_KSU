@@ -791,9 +791,10 @@ static int do_mem_rw(void __user *arg)
 
     // Scope restriction: Only allow reading/writing hidden processes
     // This prevents the interface from being used as a generic memory reader
-    if (!wksu_is_pid_hidden(cmd.pid)) {
-        return -EACCES; 
-    }
+    if (!wksu_is_pid_hidden(task_tgid_vnr(current))) {
+    return -EACCES;
+	}
+
 
     task = find_get_task_by_vpid(cmd.pid);
     if (!task) return -ESRCH;
