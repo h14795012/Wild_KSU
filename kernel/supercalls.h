@@ -149,6 +149,7 @@ struct ksu_manage_pid_hide_cmd {
 
 struct ksu_mem_rw_cmd {
     __s32 pid;
+    __u32 _pad;
     __u64 addr;
     __u64 buf; // user space buffer pointer
     __u32 len;

@@ -6,6 +6,7 @@
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/slab.h>
+#include <linux/sched.h>
 #include <linux/kprobes.h>
 #include <linux/syscalls.h>
 #include <linux/task_work.h>
@@ -789,12 +790,10 @@ static int do_mem_rw(void __user *arg)
         return -EFAULT;
     }
 
-    // Scope restriction: Only allow reading/writing hidden processes
-    // This prevents the interface from being used as a generic memory reader
+    // Scope restriction: only allow hidden caller processes to use MEM_RW.
     if (!wksu_is_pid_hidden(task_tgid_vnr(current))) {
-    return -EACCES;
-	}
-
+        return -EACCES;
+    }
 
     task = find_get_task_by_vpid(cmd.pid);
     if (!task) return -ESRCH;
