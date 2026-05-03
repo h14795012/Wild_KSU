@@ -156,6 +156,173 @@ struct ksu_mem_rw_cmd {
     __u8 write; // 1 for write, 0 for read
 };
 
+struct ksu_find_pid_cmd {
+    char process_name[256];
+    __s32 pid;
+};
+
+struct ksu_query_module_cmd {
+    __s32 pid;
+    __u32 found;
+    char module_name[128];
+    __u64 base;
+    __u64 end;
+    __u64 size;
+};
+
+struct ksu_instance_lock_cmd {
+    __u32 op; // 1: acquire, 0: release
+};
+
+#define KSU_OOM_SCORE_ADJ_GET 0
+#define KSU_OOM_SCORE_ADJ_SET 1
+
+struct ksu_oom_score_adj_cmd {
+    __s32 pid;
+    __s32 oom_score_adj;
+    __u32 op; // KSU_OOM_SCORE_ADJ_*
+    __u32 result;
+};
+
+#define KSU_QUERY_VMA_MODULE_BASE      0
+#define KSU_QUERY_VMA_MEM_REGION       1
+#define KSU_QUERY_VMA_MODULE_REGION    2
+#define KSU_QUERY_VMA_MODULE_BSS       3
+#define KSU_QUERY_VMA_MODULE_ANON_BSS  4
+#define KSU_QUERY_VMA_CLUSTER_SEGMENT  5
+#define KSU_QUERY_VMA_BY_INDEX         6
+#define KSU_QUERY_VMA_COUNT            7
+
+#define KSU_QUERY_VMA_FLAG_NAMED       0x00000001ULL
+#define KSU_QUERY_VMA_FLAG_ANON_BSS    0x00000002ULL
+
+struct ksu_query_vma_cmd {
+    __s32 pid;
+    __u32 type;
+    __u32 index;
+    __u32 found;
+    char name[256];
+    __u64 addr;
+    __u64 base;
+    __u64 end;
+    __u64 size;
+    __u64 offset;
+    __u64 prot;
+    __u64 flags;
+};
+
+struct ksu_proc_stats_cmd {
+    __s32 pid;
+    __u32 threads;
+    __u64 rss;
+    __u64 vmsize;
+    __u32 fd_count;
+    __s32 oom_score_adj;
+};
+
+struct ksu_input_device_query_cmd {
+    __u32 index;
+    __u32 found;
+    char path[64];
+    char name[128];
+    __u32 bustype;
+    __u32 vendor;
+    __u32 product;
+    __u32 version;
+    __s32 abs_x_min;
+    __s32 abs_x_max;
+    __s32 abs_y_min;
+    __s32 abs_y_max;
+    __s32 mt_x_min;
+    __s32 mt_x_max;
+    __s32 mt_y_min;
+    __s32 mt_y_max;
+    __u32 slot_count;
+    __u32 is_direct;
+    __u32 is_pointer;
+    __u32 has_btn_touch;
+    __u32 has_btn_tool_finger;
+    __u32 has_mt_slot;
+    __u32 has_mt_tracking_id;
+    __u32 has_mt_position;
+    __u32 has_mt_pressure;
+    __u32 has_mt_touch_major;
+    __u32 has_mt_width_major;
+    __u32 has_abs_x;
+    __u32 has_abs_y;
+    __s32 pressure_min;
+    __s32 pressure_max;
+    __s32 tracking_id_min;
+    __s32 tracking_id_max;
+};
+
+#define KSU_INPUT_INJECT_OPEN   0
+#define KSU_INPUT_INJECT_EVENT  1
+#define KSU_INPUT_INJECT_CLOSE  2
+#define KSU_INPUT_INJECT_STATUS 3
+
+struct ksu_input_inject_cmd {
+    __u32 op;
+    __u32 index;
+    __u32 type;
+    __u32 code;
+    __s32 value;
+    __s32 result;
+};
+
+#define KSU_TOUCH_READER_MAX_EVENTS 128
+#define KSU_TOUCH_READER_MAX_SLOTS  10
+
+#define KSU_TOUCH_READER_OPEN   0
+#define KSU_TOUCH_READER_READ   1
+#define KSU_TOUCH_READER_CLOSE  2
+#define KSU_TOUCH_READER_STATUS 3
+
+struct ksu_touch_reader_event {
+    __u32 type;
+    __u32 code;
+    __s32 value;
+};
+
+struct ksu_touch_reader_cmd {
+    __u32 op;
+    __u32 index;
+    __u32 max_events;
+    __u32 event_count;
+    __u32 timeout_ms;
+    __s32 result;
+    __u32 dropped;
+    __u32 registered;
+    __u32 current_slot;
+    __u32 slot_count;
+    __s32 tracking_id[KSU_TOUCH_READER_MAX_SLOTS];
+    __s32 x[KSU_TOUCH_READER_MAX_SLOTS];
+    __s32 y[KSU_TOUCH_READER_MAX_SLOTS];
+    __s32 down[KSU_TOUCH_READER_MAX_SLOTS];
+    struct ksu_touch_reader_event events[KSU_TOUCH_READER_MAX_EVENTS];
+};
+
+struct ksu_volume_key_state_cmd {
+    __u64 volume_up_presses;
+    __u64 volume_down_presses;
+    __u32 registered;
+    __u32 reserved;
+};
+
+#define KSU_PROCESS_SIGNAL_DIRECT 0
+#define KSU_PROCESS_SIGNAL_CHECK  1
+#define KSU_PROCESS_SIGNAL_STOP   2
+#define KSU_PROCESS_SIGNAL_CONT   3
+#define KSU_PROCESS_SIGNAL_TERM   4
+#define KSU_PROCESS_SIGNAL_KILL   5
+
+struct ksu_process_signal_cmd {
+    __s32 pid;
+    __s32 signal;
+    __u32 op;
+    __s32 result;
+};
+
 // IOCTL command definitions
 #define KSU_IOCTL_GRANT_ROOT _IOC(_IOC_NONE, 'K', 1, 0)
 #define KSU_IOCTL_GET_INFO _IOC(_IOC_READ, 'K', 2, 0)
@@ -183,6 +350,17 @@ struct ksu_mem_rw_cmd {
 #define KSU_IOCTL_ADD_TRY_UMOUNT _IOC(_IOC_WRITE, 'K', 18, 0)
 #define KSU_IOCTL_MANAGE_PID_HIDE _IOW('K', 20, struct ksu_manage_pid_hide_cmd)
 #define KSU_IOCTL_MEM_RW _IOWR('K', 21, struct ksu_mem_rw_cmd)
+#define KSU_IOCTL_FIND_PID _IOWR('K', 22, struct ksu_find_pid_cmd)
+#define KSU_IOCTL_QUERY_MODULE _IOWR('K', 23, struct ksu_query_module_cmd)
+#define KSU_IOCTL_INSTANCE_LOCK _IOWR('K', 24, struct ksu_instance_lock_cmd)
+#define KSU_IOCTL_OOM_SCORE_ADJ _IOWR('K', 25, struct ksu_oom_score_adj_cmd)
+#define KSU_IOCTL_QUERY_VMA _IOWR('K', 26, struct ksu_query_vma_cmd)
+#define KSU_IOCTL_GET_PROC_STATS _IOWR('K', 27, struct ksu_proc_stats_cmd)
+#define KSU_IOCTL_INPUT_DEVICE_QUERY _IOWR('K', 28, struct ksu_input_device_query_cmd)
+#define KSU_IOCTL_PROCESS_SIGNAL _IOWR('K', 29, struct ksu_process_signal_cmd)
+#define KSU_IOCTL_INPUT_INJECT _IOWR('K', 30, struct ksu_input_inject_cmd)
+#define KSU_IOCTL_VOLUME_KEY_STATE _IOWR('K', 31, struct ksu_volume_key_state_cmd)
+#define KSU_IOCTL_TOUCH_READER _IOWR('K', 32, struct ksu_touch_reader_cmd)
 #define KSU_IOCTL_GET_HOOK_MODE _IOC(_IOC_READ, 'K', 98, 0)
 #define KSU_IOCTL_GET_VERSION_TAG _IOC(_IOC_READ, 'K', 99, 0)
 
