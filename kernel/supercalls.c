@@ -855,13 +855,70 @@ static int do_mem_rw(void __user *arg)
     put_task_struct(task);
     return ret;
 }
+static bool ksu_process_name_matches(const char *candidate,
+                                     size_t candidate_len,
+                                     const char *target,
+                                     size_t target_len)
+{
+    if (!candidate || !target || candidate_len == 0 || target_len == 0)
+        return false;
+
+    while (candidate_len > 0 && *candidate == '\0') {
+        candidate++;
+        candidate_len--;
+    }
+    if (candidate_len == 0)
+        return false;
+
+    if (candidate_len >= target_len && !strncmp(candidate, target, target_len)) {
+        char next = candidate[target_len];
+        if (next == '\0' || next == ':' || next == ' ' || next == '\n')
+            return true;
+    }
+
+    return false;
+}
+
+static bool ksu_cmdline_matches_process(const char *cmdline,
+                                        int cmdline_len,
+                                        const char *target,
+                                        size_t target_len)
+{
+    int pos = 0;
+
+    if (!cmdline || cmdline_len <= 0)
+        return false;
+
+    while (pos < cmdline_len) {
+        const char *candidate;
+        int start;
+        size_t candidate_len;
+
+        while (pos < cmdline_len && cmdline[pos] == '\0')
+            pos++;
+        if (pos >= cmdline_len)
+            break;
+
+        start = pos;
+        while (pos < cmdline_len && cmdline[pos] != '\0')
+            pos++;
+
+        candidate = cmdline + start;
+        candidate_len = pos - start;
+        if (ksu_process_name_matches(candidate, candidate_len, target, target_len))
+            return true;
+    }
+
+    return false;
+}
+
 static int do_find_pid(void __user *arg)
 {
     struct ksu_find_pid_cmd cmd;
     struct task_struct *p;
     struct task_struct **tasks;
     pid_t *tgids;
-    int count = 0, i, max_tasks = 512;
+    int count = 0, i, max_tasks = 2048;
     pid_t found_pid = -1;
     size_t name_len;
 
@@ -895,17 +952,26 @@ static int do_find_pid(void __user *arg)
 
     for (i = 0; i < count; i++) {
         if (found_pid < 0) {
+            char comm[TASK_COMM_LEN] = {0};
             char buf[256] = {0};
-            int len = get_cmdline(tasks[i], buf, sizeof(buf) - 1);
+            int len;
+
+            get_task_comm(comm, tasks[i]);
+            if (ksu_process_name_matches(comm, strnlen(comm, sizeof(comm)), cmd.process_name, name_len)) {
+                found_pid = tgids[i];
+                goto put_task;
+            }
+
+            len = get_cmdline(tasks[i], buf, sizeof(buf) - 1);
             if (len > 0) {
+                if (len >= (int)sizeof(buf))
+                    len = sizeof(buf) - 1;
                 buf[len] = '\0';
-                if (strncmp(buf, cmd.process_name, name_len) == 0) {
-                    char next = buf[name_len];
-                    if (next == '\0' || next == ':')
-                        found_pid = tgids[i];
-                }
+                if (ksu_cmdline_matches_process(buf, len, cmd.process_name, name_len))
+                    found_pid = tgids[i];
             }
         }
+put_task:
         put_task_struct(tasks[i]);
     }
 
