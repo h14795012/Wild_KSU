@@ -156,6 +156,15 @@ struct ksu_mem_rw_cmd {
     __u8 write; // 1 for write, 0 for read
 };
 
+struct ksu_mmap_cmd {
+    __s32 pid;
+    __u32 _pad;
+    __u64 remote_addr; // Input: remote page-aligned address; Output: mapped local address
+    __u64 length;
+    __u32 prot;
+    __u32 _pad2;
+};
+
 struct ksu_find_pid_cmd {
     char process_name[256];
     __s32 pid;
@@ -361,6 +370,7 @@ struct ksu_process_signal_cmd {
 #define KSU_IOCTL_INPUT_INJECT _IOWR('K', 30, struct ksu_input_inject_cmd)
 #define KSU_IOCTL_VOLUME_KEY_STATE _IOWR('K', 31, struct ksu_volume_key_state_cmd)
 #define KSU_IOCTL_TOUCH_READER _IOWR('K', 32, struct ksu_touch_reader_cmd)
+#define KSU_IOCTL_MMAP_REMOTE _IOWR('K', 33, struct ksu_mmap_cmd)
 #define KSU_IOCTL_GET_HOOK_MODE _IOC(_IOC_READ, 'K', 98, 0)
 #define KSU_IOCTL_GET_VERSION_TAG _IOC(_IOC_READ, 'K', 99, 0)
 
