@@ -1,10 +1,13 @@
 #include <linux/anon_inodes.h>
+#include <linux/atomic.h>
 #include <linux/capability.h>
 #include <linux/cred.h>
 #include <linux/err.h>
 #include <linux/fdtable.h>
 #include <linux/file.h>
 #include <linux/fs.h>
+#include <linux/ktime.h>
+#include <linux/list.h>
 #include <linux/slab.h>
 #include <linux/sched.h>
 #include <linux/sched/mm.h>
@@ -15,6 +18,8 @@
 #include <linux/version.h>
 #include <linux/limits.h>
 #include <linux/mman.h>
+#include <linux/module.h>
+#include <linux/pfn_t.h>
 #include <linux/utsname.h> // utsname() and uts_sem
 #include <linux/mm.h>
 #include <linux/mutex.h>
@@ -41,7 +46,10 @@
 #include "supercalls.h"
 #include "arch.h"
 #include "allowlist.h"
+#include "audit.h"
+#include "breakpoint.h"
 #include "feature.h"
+#include "hook.h"
 #include "klog.h" // IWYU pragma: keep
 #include "ksu.h"
 #include "ksud.h"
@@ -798,11 +806,116 @@ static int do_manage_pid_hide(void __user *arg)
     return 0;
 }
 
+static int ksu_mem_rw_one(struct task_struct *task, u64 addr, u64 buf,
+                          u32 len, bool write, void *page_buf, u32 *done)
+{
+    u32 copied = 0;
+    int ret = 0;
+
+	if (!task || !page_buf) {
+		return -EINVAL;
+	}
+	if (!len) {
+		return -EINVAL;
+	}
+	if (addr > ULONG_MAX || buf > ULONG_MAX) {
+		return -EINVAL;
+	}
+	if (len && (addr > U64_MAX - len || buf > U64_MAX - len)) {
+		return -EINVAL;
+	}
+
+	while (len > 0) {
+		size_t bytes = min_t(size_t, len, PAGE_SIZE);
+		int accessed;
+		unsigned long not_copied;
+
+        if (write) {
+            if (copy_from_user(page_buf, (void __user *)(unsigned long)buf,
+                               bytes)) {
+                ret = -EFAULT;
+                break;
+            }
+            accessed = access_process_vm(task, (unsigned long)addr,
+                                         page_buf, bytes,
+                                         FOLL_FORCE | FOLL_WRITE);
+            if (accessed != bytes) {
+                if (accessed > 0)
+                    copied += accessed;
+                ret = -EIO;
+                break;
+            }
+        } else {
+            accessed = access_process_vm(task, (unsigned long)addr,
+                                         page_buf, bytes, FOLL_FORCE);
+            if (accessed <= 0) {
+                ret = -EIO;
+                break;
+            }
+			not_copied = copy_to_user(
+				(void __user *)(unsigned long)buf, page_buf,
+				accessed);
+			if (not_copied) {
+				copied += accessed - not_copied;
+				ret = -EFAULT;
+				break;
+			}
+            if (accessed != bytes) {
+                copied += accessed;
+                ret = -EIO;
+                break;
+            }
+        }
+
+        copied += bytes;
+        addr += bytes;
+        buf += bytes;
+        len -= bytes;
+    }
+
+    if (done) {
+        *done = copied;
+    }
+    return ret;
+}
+
+static void ksu_mem_rw_batch_reset_output(struct ksu_mem_rw_batch_cmd *cmd,
+					  u32 active_count)
+{
+	u32 i;
+
+	for (i = 0; i < KSU_MEM_RW_BATCH_MAX; i++) {
+		if (i >= active_count)
+			memset(&cmd->vecs[i], 0, sizeof(cmd->vecs[i]));
+		else {
+			cmd->vecs[i].result = 0;
+			cmd->vecs[i].done = 0;
+		}
+	}
+	cmd->completed = 0;
+	cmd->result = 0;
+	cmd->_pad = 0;
+}
+
+static void ksu_mem_rw_batch_mark_error(struct ksu_mem_rw_batch_cmd *cmd,
+					u32 active_count, int err)
+{
+	u32 i;
+
+	for (i = 0; i < active_count; i++) {
+		cmd->vecs[i].result = err;
+		cmd->vecs[i].done = 0;
+	}
+	cmd->completed = 0;
+	cmd->result = err;
+}
+
 static int do_mem_rw(void __user *arg)
 {
     struct ksu_mem_rw_cmd cmd;
     struct task_struct *task;
     void *page_buf;
+    u32 done;
     int ret = 0;
     extern bool wksu_is_pid_hidden(int pid);
 
@@ -815,6 +928,9 @@ static int do_mem_rw(void __user *arg)
         return -EACCES;
     }
 
+    if (!cmd.len || cmd.write > 1)
+        return -EINVAL;
+
     task = find_get_task_by_vpid(cmd.pid);
     if (!task) return -ESRCH;
 
@@ -824,98 +940,249 @@ static int do_mem_rw(void __user *arg)
         return -ENOMEM;
     }
 
-    while (cmd.len > 0) {
-        size_t bytes = min_t(size_t, cmd.len, PAGE_SIZE);
-
-        if (cmd.write) {
-            if (copy_from_user(page_buf, (void __user *)cmd.buf, bytes)) {
-                ret = -EFAULT;
-                break;
-            }
-            if (access_process_vm(task, (unsigned long)cmd.addr, page_buf, bytes, FOLL_FORCE | FOLL_WRITE) != bytes) {
-                ret = -EIO;
-                break;
-            }
-        } else {
-            if (access_process_vm(task, (unsigned long)cmd.addr, page_buf, bytes, FOLL_FORCE) != bytes) {
-                ret = -EIO;
-                break;
-            }
-            if (copy_to_user((void __user *)cmd.buf, page_buf, bytes)) {
-                ret = -EFAULT;
-                break;
-            }
-        }
-
-        cmd.addr += bytes;
-        cmd.buf += bytes;
-        cmd.len -= bytes;
-    }
+    ret = ksu_mem_rw_one(task, cmd.addr, cmd.buf, cmd.len, !!cmd.write,
+                         page_buf, &done);
 
     free_page((unsigned long)page_buf);
     put_task_struct(task);
     return ret;
 }
 
-#define WKSU_MMAP_MAX_PAGES 4096
+static int do_mem_rw_batch(void __user *arg)
+{
+    struct ksu_mem_rw_batch_cmd *cmd;
+    struct task_struct *task = NULL;
+	void *page_buf = NULL;
+	u32 count;
+	u32 active_count;
+	u32 flags;
+	u32 i;
+	int first_error = 0;
+    int ret = 0;
+    extern bool wksu_is_pid_hidden(int pid);
+
+    cmd = kvzalloc(sizeof(*cmd), GFP_KERNEL);
+    if (!cmd)
+        return -ENOMEM;
+
+    if (copy_from_user(cmd, arg, sizeof(*cmd))) {
+        ret = -EFAULT;
+        goto out;
+    }
+
+	count = cmd->count;
+	flags = cmd->flags;
+	active_count = min_t(u32, count, KSU_MEM_RW_BATCH_MAX);
+	ksu_mem_rw_batch_reset_output(cmd, active_count);
+	cmd->count = count;
+	cmd->flags = flags;
+
+	if (!count || count > KSU_MEM_RW_BATCH_MAX) {
+		ret = -EINVAL;
+		ksu_mem_rw_batch_mark_error(cmd, active_count, ret);
+		goto copy_out;
+	}
+	if (flags & ~KSU_MEM_RW_BATCH_F_CONTINUE_ON_ERROR) {
+		ret = -EINVAL;
+		ksu_mem_rw_batch_mark_error(cmd, active_count, ret);
+		goto copy_out;
+	}
+
+	if (!wksu_is_pid_hidden(task_tgid_vnr(current))) {
+		ret = -EACCES;
+		ksu_mem_rw_batch_mark_error(cmd, active_count, ret);
+		goto copy_out;
+	}
+
+	task = find_get_task_by_vpid(cmd->pid);
+	if (!task) {
+		ret = -ESRCH;
+		ksu_mem_rw_batch_mark_error(cmd, active_count, ret);
+		goto copy_out;
+	}
+
+	page_buf = (void *)__get_free_page(GFP_KERNEL);
+	if (!page_buf) {
+		ret = -ENOMEM;
+		ksu_mem_rw_batch_mark_error(cmd, active_count, ret);
+		goto copy_out;
+	}
+
+    for (i = 0; i < count; i++) {
+        struct ksu_mem_rw_vec *vec = &cmd->vecs[i];
+        int cur;
+
+        if (!vec->len || vec->write > 1)
+            cur = -EINVAL;
+        else
+            cur = ksu_mem_rw_one(task, vec->addr, vec->buf, vec->len,
+                                 !!vec->write, page_buf, &vec->done);
+
+        vec->result = cur;
+        if (!cur)
+            cmd->completed++;
+        else if (!first_error)
+            first_error = cur;
+
+        if (cur && !(flags & KSU_MEM_RW_BATCH_F_CONTINUE_ON_ERROR)) {
+            u32 j;
+
+            for (j = i + 1; j < count; j++) {
+                cmd->vecs[j].result = -ECANCELED;
+                cmd->vecs[j].done = 0;
+            }
+            break;
+        }
+    }
+
+copy_out:
+    if (page_buf)
+        free_page((unsigned long)page_buf);
+    if (task)
+        put_task_struct(task);
+
+    if (ret)
+        first_error = ret;
+    cmd->result = first_error;
+    cmd->count = count;
+    cmd->flags = flags;
+    if (copy_to_user(arg, cmd, sizeof(*cmd)))
+        ret = -EFAULT;
+
+out:
+    kvfree(cmd);
+    return ret;
+}
+
+#define WKSU_MMAP_MAX_PAGES 262144
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+#define ksu_vm_flags_set(vma, flags)   vm_flags_set(vma, flags)
+#define ksu_vm_flags_clear(vma, flags) vm_flags_clear(vma, flags)
+#else
+#define ksu_vm_flags_set(vma, flags)   ((vma)->vm_flags |= (flags))
+#define ksu_vm_flags_clear(vma, flags) ((vma)->vm_flags &= ~(flags))
+#endif
 
 struct ksu_remote_mmap_ctx {
+    struct mutex lock;
+    struct list_head node;
+    struct mm_struct *remote_mm;
     struct page **pages;
+    u64 id;
+    u64 created_ns;
+    u64 mapped_ns;
     unsigned long nr_pages;
+    u32 pinned_pages;
+    unsigned long remote_addr;
+    unsigned long mapped_addr;
+    unsigned long map_len;
+    pid_t creator_pid;
+    pid_t creator_tgid;
+    int fd;
     bool writable;
+    bool snapshot;
+    bool mapped;
+    bool registered;
 };
 
-static void ksu_remote_mmap_release(struct ksu_remote_mmap_ctx *ctx)
-{
-    unsigned long i;
+static LIST_HEAD(ksu_remote_mmap_registry);
+static DEFINE_MUTEX(ksu_remote_mmap_registry_lock);
+static atomic64_t ksu_remote_mmap_next_id = ATOMIC64_INIT(0);
 
+static void ksu_remote_mmap_register(struct ksu_remote_mmap_ctx *ctx, int fd)
+{
     if (!ctx)
         return;
 
-    if (ctx->pages) {
-        for (i = 0; i < ctx->nr_pages; i++) {
-            if (!ctx->pages[i])
-                continue;
-            if (ctx->writable)
-                set_page_dirty_lock(ctx->pages[i]);
-            put_user_page(ctx->pages[i]);
-        }
-        kvfree(ctx->pages);
+    ctx->id = atomic64_inc_return(&ksu_remote_mmap_next_id);
+    ctx->created_ns = ktime_get_ns();
+    ctx->creator_pid = task_pid_nr(current);
+    ctx->creator_tgid = task_tgid_vnr(current);
+    ctx->fd = fd;
+
+	mutex_lock(&ksu_remote_mmap_registry_lock);
+	list_add_tail(&ctx->node, &ksu_remote_mmap_registry);
+	ctx->registered = true;
+	mutex_unlock(&ksu_remote_mmap_registry_lock);
+
+	wksu_audit_log(WKSU_AUDIT_MMAP_REMOTE_CREATE, 0, 0,
+		       ctx->remote_addr, ctx->map_len, "mmap_remote_fd");
+}
+
+static void ksu_remote_mmap_unregister(struct ksu_remote_mmap_ctx *ctx)
+{
+    if (!ctx)
+        return;
+
+    mutex_lock(&ksu_remote_mmap_registry_lock);
+    if (ctx->registered) {
+        list_del_init(&ctx->node);
+        ctx->registered = false;
     }
-
-    kfree(ctx);
+    mutex_unlock(&ksu_remote_mmap_registry_lock);
 }
 
-static void ksu_remote_mmap_close(struct vm_area_struct *vma)
+static void ksu_remote_mmap_mark_mapped(struct ksu_remote_mmap_ctx *ctx,
+                                        unsigned long mapped_addr)
 {
-    struct ksu_remote_mmap_ctx *ctx = vma->vm_private_data;
-
-    vma->vm_private_data = NULL;
-    ksu_remote_mmap_release(ctx);
+    mutex_lock(&ksu_remote_mmap_registry_lock);
+    ctx->mapped_addr = mapped_addr;
+    ctx->mapped_ns = ktime_get_ns();
+    ctx->mapped = true;
+    mutex_unlock(&ksu_remote_mmap_registry_lock);
 }
 
-static int ksu_remote_mmap_split(struct vm_area_struct *vma,
-                                 unsigned long addr)
+static void ksu_remote_mmap_fill_info(struct ksu_remote_mmap_ctx *ctx,
+                                      struct wksu_mmap_remote_info *info)
 {
-    return -EINVAL;
+    memset(info, 0, sizeof(*info));
+    info->id = ctx->id;
+    info->creator_pid = ctx->creator_pid;
+    info->creator_tgid = ctx->creator_tgid;
+    info->fd = ctx->fd;
+    info->flags = 0;
+    if (ctx->writable)
+        info->flags |= WKSU_MMAP_REMOTE_F_WRITABLE;
+    if (ctx->mapped)
+        info->flags |= WKSU_MMAP_REMOTE_F_MAPPED;
+    if (ctx->snapshot)
+        info->flags |= WKSU_MMAP_REMOTE_F_SNAPSHOT;
+    info->remote_addr = ctx->remote_addr;
+    info->mapped_addr = ctx->mapped_addr;
+    info->length = ctx->map_len;
+    info->nr_pages = ctx->nr_pages;
+    info->pinned_pages = READ_ONCE(ctx->pinned_pages);
+    info->created_ns = ctx->created_ns;
+    info->mapped_ns = ctx->mapped_ns;
 }
 
-static int ksu_remote_mmap_mremap(struct vm_area_struct *vma)
+static void ksu_remote_mmap_snapshot(struct wksu_mmap_remote_info *infos,
+                                     u32 max_entries, u32 *entry_count,
+                                     u32 *total_entries)
 {
-    return -EINVAL;
-}
+    struct ksu_remote_mmap_ctx *ctx;
+    u32 copied = 0;
+    u32 total = 0;
 
-static const char *ksu_remote_mmap_name(struct vm_area_struct *vma)
-{
-    return "[ksu_remote_mmap]";
-}
+    if (max_entries > WKSU_MMAP_REMOTE_MAX_STATUS)
+        max_entries = WKSU_MMAP_REMOTE_MAX_STATUS;
 
-static const struct vm_operations_struct ksu_remote_mmap_vm_ops = {
-    .close = ksu_remote_mmap_close,
-    .split = ksu_remote_mmap_split,
-    .mremap = ksu_remote_mmap_mremap,
-    .name = ksu_remote_mmap_name,
-};
+    mutex_lock(&ksu_remote_mmap_registry_lock);
+    list_for_each_entry(ctx, &ksu_remote_mmap_registry, node) {
+        total++;
+        if (copied < max_entries && infos) {
+            ksu_remote_mmap_fill_info(ctx, &infos[copied]);
+            copied++;
+        }
+    }
+    mutex_unlock(&ksu_remote_mmap_registry_lock);
+
+    if (entry_count)
+        *entry_count = copied;
+    if (total_entries)
+        *total_entries = total;
+}
 
 static void ksu_release_pages(struct page **pages, unsigned long nr_pages,
                               bool writable)
@@ -934,22 +1201,329 @@ static void ksu_release_pages(struct page **pages, unsigned long nr_pages,
     }
 }
 
+static void ksu_release_private_pages(struct page **pages,
+                                      unsigned long nr_pages)
+{
+    unsigned long i;
+
+    if (!pages)
+        return;
+
+    for (i = 0; i < nr_pages; i++) {
+        if (!pages[i])
+            continue;
+        put_page(pages[i]);
+    }
+}
+
+static void ksu_remote_mmap_release(struct ksu_remote_mmap_ctx *ctx)
+{
+    if (!ctx)
+        return;
+
+    ksu_remote_mmap_unregister(ctx);
+
+    if (ctx->pages) {
+        if (ctx->snapshot)
+            ksu_release_private_pages(ctx->pages, ctx->nr_pages);
+        else
+            ksu_release_pages(ctx->pages, ctx->nr_pages, ctx->writable);
+        kvfree(ctx->pages);
+    }
+
+	if (ctx->remote_mm) {
+		mmput(ctx->remote_mm);
+	}
+
+	wksu_audit_log(WKSU_AUDIT_MMAP_REMOTE_RELEASE, 0,
+		       ctx->mapped_addr, ctx->remote_addr, ctx->map_len,
+		       ctx->mapped_addr ? "mmap_remote" : "mmap_remote_fd");
+
+    kfree(ctx);
+}
+
+static void ksu_remote_mmap_close(struct vm_area_struct *vma)
+{
+    struct ksu_remote_mmap_ctx *ctx = vma->vm_private_data;
+
+    vma->vm_private_data = NULL;
+    if (ctx) {
+        ksu_remote_mmap_release(ctx);
+        module_put(THIS_MODULE);
+    }
+}
+
+static int ksu_remote_mmap_split(struct vm_area_struct *vma,
+                                 unsigned long addr)
+{
+    return -EINVAL;
+}
+
+static int ksu_remote_mmap_mremap(struct vm_area_struct *vma)
+{
+    return -EINVAL;
+}
+
+static const char *ksu_remote_mmap_name(struct vm_area_struct *vma)
+{
+    return "[ksu_remote_mmap]";
+}
+
+static vm_fault_t ksu_remote_mmap_fault(struct vm_fault *vmf);
+
+static const struct vm_operations_struct ksu_remote_mmap_vm_ops = {
+    .close = ksu_remote_mmap_close,
+    .split = ksu_remote_mmap_split,
+    .mremap = ksu_remote_mmap_mremap,
+    .fault = ksu_remote_mmap_fault,
+    .name = ksu_remote_mmap_name,
+};
+
+static int ksu_remote_mmap_pin_page_locked(struct ksu_remote_mmap_ctx *ctx,
+                                           unsigned long index)
+{
+    unsigned int gup_flags = 0;
+    struct page *page = NULL;
+    int locked = 1;
+    long pinned;
+
+    if (!ctx->remote_mm)
+        return -EINVAL;
+    if (!ctx->pages || index >= ctx->nr_pages)
+        return -EINVAL;
+    if (ctx->pages[index])
+        return 0;
+
+    if (ctx->remote_mm == current->mm)
+        return -EINVAL;
+
+    if (ctx->writable)
+        gup_flags |= FOLL_WRITE;
+
+    mmap_read_lock(ctx->remote_mm);
+    pinned = get_user_pages_remote(ctx->remote_mm,
+                                   ctx->remote_addr + (index << PAGE_SHIFT),
+                                   1, gup_flags, &page, NULL, &locked);
+    if (locked)
+        mmap_read_unlock(ctx->remote_mm);
+
+    if (pinned < 0)
+        return pinned;
+
+    if (pinned != 1) {
+        if (pinned > 0 && page)
+            put_user_page(page);
+        return -EFAULT;
+    }
+
+    ctx->pages[index] = page;
+    ctx->pinned_pages++;
+    return 0;
+}
+
+static int ksu_remote_mmap_snapshot_page_locked(struct ksu_remote_mmap_ctx *ctx,
+                                                unsigned long index)
+{
+    struct page *remote_page = NULL;
+    struct page *snapshot_page;
+    unsigned int gup_flags = 0;
+    int locked = 1;
+    long pinned;
+
+    if (!ctx->remote_mm)
+        return -EINVAL;
+    if (!ctx->pages || index >= ctx->nr_pages)
+        return -EINVAL;
+    if (ctx->pages[index])
+        return 0;
+    if (ctx->remote_mm == current->mm)
+        return -EINVAL;
+
+    snapshot_page = alloc_page(GFP_KERNEL);
+    if (!snapshot_page)
+        return -ENOMEM;
+
+    mmap_read_lock(ctx->remote_mm);
+    pinned = get_user_pages_remote(ctx->remote_mm,
+                                   ctx->remote_addr + (index << PAGE_SHIFT),
+                                   1, gup_flags, &remote_page, NULL, &locked);
+    if (locked)
+        mmap_read_unlock(ctx->remote_mm);
+
+    if (pinned < 0) {
+        put_page(snapshot_page);
+        return pinned;
+    }
+
+    if (pinned != 1) {
+        if (pinned > 0 && remote_page)
+            put_user_page(remote_page);
+        put_page(snapshot_page);
+        return -EFAULT;
+    }
+
+	copy_highpage(snapshot_page, remote_page);
+	put_user_page(remote_page);
+
+	ctx->pages[index] = snapshot_page;
+	return 0;
+}
+
+static vm_fault_t ksu_remote_mmap_fault(struct vm_fault *vmf)
+{
+    struct vm_area_struct *vma = vmf->vma;
+    struct ksu_remote_mmap_ctx *ctx = vma->vm_private_data;
+    unsigned long addr = vmf->address & PAGE_MASK;
+    unsigned long index;
+    vm_fault_t fault;
+    int ret;
+
+    if (!ctx || addr < vma->vm_start)
+        return VM_FAULT_SIGBUS;
+
+    index = (addr - vma->vm_start) >> PAGE_SHIFT;
+    if (index >= ctx->nr_pages)
+        return VM_FAULT_SIGBUS;
+
+    mutex_lock(&ctx->lock);
+    if (ctx->snapshot)
+        ret = ksu_remote_mmap_snapshot_page_locked(ctx, index);
+    else
+        ret = ksu_remote_mmap_pin_page_locked(ctx, index);
+    if (ret) {
+        mutex_unlock(&ctx->lock);
+        if (ret == -ENOMEM)
+            return VM_FAULT_OOM;
+        return VM_FAULT_SIGBUS;
+    }
+
+	if (ctx->snapshot) {
+		ret = vm_insert_page(vma, addr, ctx->pages[index]);
+		if (!ret || ret == -EBUSY)
+			fault = VM_FAULT_NOPAGE;
+		else if (ret == -ENOMEM)
+			fault = VM_FAULT_OOM;
+		else
+			fault = VM_FAULT_SIGBUS;
+	} else {
+		fault = vmf_insert_mixed(vma, addr,
+					 page_to_pfn_t(ctx->pages[index]));
+	}
+    mutex_unlock(&ctx->lock);
+    return fault;
+}
+
+static int ksu_remote_mmap_file_mmap(struct file *file,
+				     struct vm_area_struct *vma)
+{
+	struct ksu_remote_mmap_ctx *ctx;
+	unsigned long vma_len;
+	bool module_ref = false;
+	int ret = 0;
+
+	ctx = xchg(&file->private_data, NULL);
+	if (!ctx)
+		return -EBUSY;
+
+	vma_len = vma->vm_end - vma->vm_start;
+	if (vma_len != ctx->map_len || vma->vm_pgoff) {
+		ret = -EINVAL;
+		goto out_restore;
+	}
+
+	if (!(vma->vm_flags & VM_READ) || !(vma->vm_flags & VM_SHARED)) {
+		ret = -EACCES;
+		goto out_restore;
+	}
+
+	if ((vma->vm_flags & VM_WRITE) && !ctx->writable) {
+		ret = -EACCES;
+		goto out_restore;
+	}
+
+	if (vma->vm_flags & VM_EXEC) {
+		ret = -EACCES;
+		goto out_restore;
+	}
+
+	mutex_lock(&ctx->lock);
+	if (ctx->mapped) {
+        ret = -EBUSY;
+        goto out_unlock;
+    }
+
+    ctx->pages = kvmalloc_array(ctx->nr_pages, sizeof(*ctx->pages),
+                                GFP_KERNEL);
+    if (!ctx->pages) {
+        ret = -ENOMEM;
+        goto out_unlock;
+    }
+    memset(ctx->pages, 0, ctx->nr_pages * sizeof(*ctx->pages));
+
+    if (!try_module_get(THIS_MODULE)) {
+        ret = -ENODEV;
+        goto out_free_pages;
+    }
+    module_ref = true;
+
+	if (ctx->snapshot)
+		ksu_vm_flags_set(vma, VM_DONTCOPY | VM_DONTDUMP |
+				      VM_DONTEXPAND | VM_MIXEDMAP);
+	else
+		ksu_vm_flags_set(vma, VM_DONTCOPY | VM_DONTDUMP |
+				      VM_DONTEXPAND | VM_MIXEDMAP);
+    ksu_vm_flags_clear(vma, VM_EXEC | VM_MAYEXEC);
+    if (!ctx->writable || ctx->snapshot)
+        ksu_vm_flags_clear(vma, VM_WRITE | VM_MAYWRITE);
+    vma_set_page_prot(vma);
+
+    ksu_remote_mmap_mark_mapped(ctx, vma->vm_start);
+    vma->vm_ops = &ksu_remote_mmap_vm_ops;
+    vma->vm_private_data = ctx;
+    file->private_data = NULL;
+
+    wksu_audit_log(WKSU_AUDIT_MMAP_REMOTE_CREATE, 0,
+                   ctx->mapped_addr, ctx->remote_addr, ctx->map_len,
+                   "mmap_remote");
+
+    mutex_unlock(&ctx->lock);
+    return 0;
+
+out_free_pages:
+	if (module_ref)
+		module_put(THIS_MODULE);
+	kvfree(ctx->pages);
+	ctx->pages = NULL;
+out_unlock:
+	mutex_unlock(&ctx->lock);
+out_restore:
+	WRITE_ONCE(file->private_data, ctx);
+	return ret;
+}
+
+static int ksu_remote_mmap_file_release(struct inode *inode, struct file *file)
+{
+	struct ksu_remote_mmap_ctx *ctx = xchg(&file->private_data, NULL);
+
+	ksu_remote_mmap_release(ctx);
+	return 0;
+}
+
+static const struct file_operations ksu_remote_mmap_fops = {
+    .owner = THIS_MODULE,
+    .mmap = ksu_remote_mmap_file_mmap,
+    .release = ksu_remote_mmap_file_release,
+};
+
 static int do_mmap_remote(void __user *arg)
 {
     struct ksu_mmap_cmd cmd;
     struct ksu_remote_mmap_ctx *ctx = NULL;
     struct task_struct *task = NULL;
-    struct mm_struct *remote_mm = NULL;
-    struct vm_area_struct *vma;
     unsigned long nr_pages;
     unsigned long map_len;
-    unsigned long mapped_addr;
-    unsigned int gup_flags = 0;
-    long pinned;
-    bool ctx_owned_by_vma = false;
-    int ret = 0;
-    int i;
-    int locked;
+    u32 flags;
+    int fd;
     extern bool wksu_is_pid_hidden(int pid);
 
     if (copy_from_user(&cmd, arg, sizeof(cmd)))
@@ -964,11 +1538,23 @@ static int do_mmap_remote(void __user *arg)
     if (cmd.pid <= 0 || cmd.length == 0)
         return -EINVAL;
 
+    flags = cmd.flags;
+    if (flags & ~KSU_MMAP_F_SNAPSHOT)
+        return -EINVAL;
+
     if (!(cmd.prot & PROT_READ) ||
         (cmd.prot & ~(PROT_READ | PROT_WRITE)))
         return -EINVAL;
+    if ((flags & KSU_MMAP_F_SNAPSHOT) && (cmd.prot & PROT_WRITE))
+        return -EINVAL;
 
     if (cmd.remote_addr & (PAGE_SIZE - 1))
+        return -EINVAL;
+
+    if (cmd.length & (PAGE_SIZE - 1))
+        return -EINVAL;
+
+    if (cmd.remote_addr > ULONG_MAX || cmd.length > ULONG_MAX)
         return -EINVAL;
 
     if (cmd.length > ((__u64)WKSU_MMAP_MAX_PAGES << PAGE_SHIFT))
@@ -983,122 +1569,172 @@ static int do_mmap_remote(void __user *arg)
     if (!ctx)
         return -ENOMEM;
 
-    ctx->pages = kvmalloc_array(nr_pages, sizeof(*ctx->pages), GFP_KERNEL);
-    if (!ctx->pages) {
-        ret = -ENOMEM;
-        goto out_free_ctx;
-    }
-    memset(ctx->pages, 0, nr_pages * sizeof(*ctx->pages));
+    mutex_init(&ctx->lock);
+    INIT_LIST_HEAD(&ctx->node);
     ctx->nr_pages = nr_pages;
     ctx->writable = !!(cmd.prot & PROT_WRITE);
+    ctx->snapshot = !!(flags & KSU_MMAP_F_SNAPSHOT);
+    ctx->remote_addr = cmd.remote_addr;
+    ctx->map_len = map_len;
 
     task = find_get_task_by_vpid(cmd.pid);
     if (!task) {
-        ret = -ESRCH;
-        goto out_free_ctx;
+        ksu_remote_mmap_release(ctx);
+        return -ESRCH;
     }
 
-    remote_mm = get_task_mm(task);
-    if (!remote_mm) {
-        ret = -EINVAL;
-        goto out_free_ctx;
-    }
-
-    if (ctx->writable)
-        gup_flags |= FOLL_WRITE;
-
-    locked = 1;
-    mmap_read_lock(remote_mm);
-    pinned = get_user_pages_remote(remote_mm, cmd.remote_addr, nr_pages,
-                                   gup_flags, ctx->pages, NULL, &locked);
-    if (locked)
-        mmap_read_unlock(remote_mm);
-    if (pinned < 0) {
-        ret = pinned;
-        goto out_free_ctx;
-    }
-
-    if (pinned != nr_pages) {
-        ksu_release_pages(ctx->pages, pinned, ctx->writable);
-        ret = -EFAULT;
-        goto out_free_ctx_no_pages;
-    }
-
-    mapped_addr = vm_mmap(NULL, 0, map_len, cmd.prot,
-                          MAP_SHARED | MAP_ANONYMOUS, 0);
-    if (IS_ERR_VALUE(mapped_addr)) {
-        ret = (long)mapped_addr;
-        goto out_release_pages;
-    }
-
-    ret = mmap_write_lock_killable(current->mm);
-    if (ret)
-        goto out_unmap;
-
-    vma = find_vma(current->mm, mapped_addr);
-    if (!vma || vma->vm_start != mapped_addr ||
-        vma->vm_end != mapped_addr + map_len) {
-        mmap_write_unlock(current->mm);
-        ret = -EBUSY;
-        goto out_unmap;
-    }
-
-    vma->vm_ops = &ksu_remote_mmap_vm_ops;
-    vma->vm_private_data = ctx;
-    vma->vm_flags |= VM_DONTCOPY | VM_DONTDUMP | VM_DONTEXPAND |
-                     VM_IO | VM_PFNMAP;
-    vma->vm_flags &= ~(VM_EXEC | VM_MAYEXEC);
-    if (!ctx->writable)
-        vma->vm_flags &= ~VM_MAYWRITE;
-    vma_set_page_prot(vma);
-    ctx_owned_by_vma = true;
-
-    for (i = 0; i < nr_pages; i++) {
-        ret = remap_pfn_range(vma, mapped_addr + (i << PAGE_SHIFT),
-                              page_to_pfn(ctx->pages[i]), PAGE_SIZE,
-                              vma->vm_page_prot);
-        if (ret)
-            break;
-    }
-
-    mmap_write_unlock(current->mm);
-    if (ret)
-        goto out_unmap;
-
-    cmd.remote_addr = mapped_addr;
-    if (copy_to_user(arg, &cmd, sizeof(cmd))) {
-        ret = -EFAULT;
-        goto out_unmap;
-    }
-
-    mmput(remote_mm);
+    ctx->remote_mm = get_task_mm(task);
     put_task_struct(task);
-    return 0;
-
-out_unmap:
-    if (vm_munmap(mapped_addr, map_len))
-        pr_warn("mmap_remote: failed to unmap 0x%lx len 0x%lx\n",
-                mapped_addr, map_len);
-    if (ctx_owned_by_vma) {
-        mmput(remote_mm);
-        put_task_struct(task);
-        return ret;
+    if (!ctx->remote_mm) {
+        ksu_remote_mmap_release(ctx);
+        return -EINVAL;
     }
-out_release_pages:
-    ksu_release_pages(ctx->pages, nr_pages, ctx->writable);
-    ctx->nr_pages = 0;
-out_free_ctx:
-    ksu_remote_mmap_release(ctx);
-    if (remote_mm)
-        mmput(remote_mm);
-    if (task)
-        put_task_struct(task);
-    return ret;
+    if (ctx->remote_mm == current->mm) {
+        ksu_remote_mmap_release(ctx);
+        return -EINVAL;
+    }
 
-out_free_ctx_no_pages:
-    kvfree(ctx->pages);
-    ctx->pages = NULL;
-    goto out_free_ctx;
+    fd = anon_inode_getfd("[ksu_remote_mmap]", &ksu_remote_mmap_fops, ctx,
+                          O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        ksu_remote_mmap_release(ctx);
+        return fd;
+    }
+    ksu_remote_mmap_register(ctx, fd);
+    ctx = NULL;
+
+    cmd.fd = fd;
+    cmd.flags = flags;
+    if (copy_to_user(arg, &cmd, sizeof(cmd))) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
+        close_fd(fd);
+#else
+        ksys_close(fd);
+#endif
+        return -EFAULT;
+    }
+
+    return 0;
+}
+
+static int do_mmap_remote_status(void __user *arg)
+{
+    struct ksu_mmap_status_cmd *cmd;
+    u32 max_entries;
+    int ret = 0;
+
+    cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+    if (!cmd)
+        return -ENOMEM;
+
+    if (copy_from_user(cmd, arg, sizeof(*cmd))) {
+        ret = -EFAULT;
+        goto out;
+    }
+
+    max_entries = min_t(u32, cmd->max_entries, WKSU_MMAP_REMOTE_MAX_STATUS);
+    memset(cmd, 0, sizeof(*cmd));
+    cmd->max_entries = max_entries;
+
+    ksu_remote_mmap_snapshot(cmd->entries, max_entries, &cmd->entry_count,
+                             &cmd->total_entries);
+
+    if (copy_to_user(arg, cmd, sizeof(*cmd)))
+        ret = -EFAULT;
+
+out:
+    kfree(cmd);
+    return ret;
+}
+
+static int do_audit(void __user *arg)
+{
+    struct ksu_audit_cmd *cmd;
+    bool enabled = false;
+    u32 enabled_in;
+    u32 op;
+    u32 max_events;
+    int ret = 0;
+
+    cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+    if (!cmd)
+        return -ENOMEM;
+
+    if (copy_from_user(cmd, arg, sizeof(*cmd))) {
+        ret = -EFAULT;
+        goto out;
+    }
+
+    op = cmd->op;
+    enabled_in = cmd->enabled;
+    max_events = min_t(u32, cmd->max_events, WKSU_AUDIT_MAX_EVENTS);
+    memset(cmd, 0, sizeof(*cmd));
+    cmd->op = op;
+    cmd->max_events = max_events;
+
+    switch (op) {
+    case WKSU_AUDIT_GET:
+        wksu_audit_snapshot(NULL, 0, &cmd->event_count, &cmd->dropped,
+                            &cmd->next_seq, &enabled);
+        cmd->enabled = enabled ? 1 : 0;
+        break;
+    case WKSU_AUDIT_SET:
+        wksu_audit_set_enabled(!!enabled_in);
+        wksu_audit_snapshot(NULL, 0, &cmd->event_count, &cmd->dropped,
+                            &cmd->next_seq, &enabled);
+        cmd->enabled = enabled ? 1 : 0;
+        break;
+    case WKSU_AUDIT_CLEAR:
+        wksu_audit_clear();
+        wksu_audit_snapshot(NULL, 0, &cmd->event_count, &cmd->dropped,
+                            &cmd->next_seq, &enabled);
+        cmd->enabled = enabled ? 1 : 0;
+        break;
+    case WKSU_AUDIT_READ:
+        wksu_audit_snapshot(cmd->events, max_events, &cmd->event_count,
+                            &cmd->dropped, &cmd->next_seq, &enabled);
+        cmd->enabled = enabled ? 1 : 0;
+        break;
+    default:
+        ret = -EINVAL;
+        goto out;
+    }
+
+    if (copy_to_user(arg, cmd, sizeof(*cmd)))
+        ret = -EFAULT;
+
+out:
+    kfree(cmd);
+    return ret;
+}
+
+static int do_hook_status(void __user *arg)
+{
+    struct ksu_hook_status_cmd *cmd;
+    u32 max_hooks;
+    int ret = 0;
+
+    cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+    if (!cmd)
+        return -ENOMEM;
+
+    if (copy_from_user(cmd, arg, sizeof(*cmd))) {
+        ret = -EFAULT;
+        goto out;
+    }
+
+    max_hooks = min_t(u32, cmd->max_hooks, WKSU_HOOK_MAX_STATUS);
+    memset(cmd, 0, sizeof(*cmd));
+    cmd->max_hooks = max_hooks;
+    wksu_hook_snapshot(cmd->hooks, max_hooks, &cmd->hook_count,
+                       &cmd->total_hooks);
+
+    if (copy_to_user(arg, cmd, sizeof(*cmd)))
+        ret = -EFAULT;
+
+out:
+    kfree(cmd);
+    return ret;
 }
 
 static bool ksu_process_name_matches(const char *candidate,
@@ -2683,9 +3319,29 @@ static const struct ksu_ioctl_cmd_map ksu_ioctl_handlers[] = {
       .name = "MEM_RW",
       .handler = do_mem_rw,
       .perm_check = manager_or_root },
+    { .cmd = KSU_IOCTL_MEM_RW_BATCH,
+      .name = "MEM_RW_BATCH",
+      .handler = do_mem_rw_batch,
+      .perm_check = manager_or_root },
     { .cmd = KSU_IOCTL_MMAP_REMOTE,
       .name = "MMAP_REMOTE",
       .handler = do_mmap_remote,
+      .perm_check = manager_or_root },
+    { .cmd = KSU_IOCTL_AUDIT,
+      .name = "AUDIT",
+      .handler = do_audit,
+      .perm_check = manager_or_root },
+    { .cmd = KSU_IOCTL_HOOK_STATUS,
+      .name = "HOOK_STATUS",
+      .handler = do_hook_status,
+      .perm_check = manager_or_root },
+    { .cmd = KSU_IOCTL_BREAKPOINT,
+      .name = "BREAKPOINT",
+      .handler = wksu_breakpoint_ioctl,
+      .perm_check = manager_or_root },
+    { .cmd = KSU_IOCTL_MMAP_REMOTE_STATUS,
+      .name = "MMAP_REMOTE_STATUS",
+      .handler = do_mmap_remote_status,
       .perm_check = manager_or_root },
     { .cmd = KSU_IOCTL_FIND_PID,
       .name = "FIND_PID",
@@ -3151,6 +3807,8 @@ void ksu_supercalls_init(void)
 
 void ksu_supercalls_exit(void)
 {
+    wksu_hook_clear_all();
+    wksu_breakpoint_clear_all();
     ksu_touch_reader_unregister_handler();
     ksu_volume_unregister_handler();
     mutex_lock(&ksu_touch_reader_mutex);

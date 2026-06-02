@@ -4,6 +4,9 @@
 #include <linux/types.h>
 #include <linux/ioctl.h>
 #include "app_profile.h"
+#include "audit.h"
+#include "breakpoint.h"
+#include "hook.h"
 
 // Magic numbers for reboot hook to install fd
 #define KSU_INSTALL_MAGIC1 0xDEADBEEF
@@ -156,13 +159,66 @@ struct ksu_mem_rw_cmd {
     __u8 write; // 1 for write, 0 for read
 };
 
+#define KSU_MEM_RW_BATCH_MAX 64
+#define KSU_MEM_RW_BATCH_F_CONTINUE_ON_ERROR (1U << 0)
+
+struct ksu_mem_rw_vec {
+    __u64 addr;
+    __u64 buf; // user space buffer pointer
+    __u32 len;
+    __u8 write; // 1 for write, 0 for read
+    __u8 _pad[3];
+    __s32 result;
+    __u32 done;
+};
+
+struct ksu_mem_rw_batch_cmd {
+    __s32 pid;
+    __u32 count;
+    __u32 flags;
+    __u32 completed;
+    __s32 result;
+    __u32 _pad;
+    struct ksu_mem_rw_vec vecs[KSU_MEM_RW_BATCH_MAX];
+};
+
 struct ksu_mmap_cmd {
     __s32 pid;
-    __u32 _pad;
-    __u64 remote_addr; // Input: remote page-aligned address; Output: mapped local address
+    __u32 fd; // Output: anon inode fd for mmap()
+    __u64 remote_addr; // Input: remote page-aligned address
     __u64 length;
     __u32 prot;
-    __u32 _pad2;
+    __u32 flags;
+};
+
+#define KSU_MMAP_F_SNAPSHOT (1U << 0)
+
+#define WKSU_MMAP_REMOTE_MAX_STATUS 64
+#define WKSU_MMAP_REMOTE_F_WRITABLE (1U << 0)
+#define WKSU_MMAP_REMOTE_F_MAPPED   (1U << 1)
+#define WKSU_MMAP_REMOTE_F_SNAPSHOT (1U << 2)
+
+struct wksu_mmap_remote_info {
+    __u64 id;
+    __s32 creator_pid;
+    __s32 creator_tgid;
+    __s32 fd;
+    __u32 flags;
+    __u64 remote_addr;
+    __u64 mapped_addr;
+    __u64 length;
+    __u32 nr_pages;
+    __u32 pinned_pages;
+    __u64 created_ns;
+    __u64 mapped_ns;
+};
+
+struct ksu_mmap_status_cmd {
+    __u32 max_entries;
+    __u32 entry_count;
+    __u32 total_entries;
+    __u32 _pad;
+    struct wksu_mmap_remote_info entries[WKSU_MMAP_REMOTE_MAX_STATUS];
 };
 
 struct ksu_find_pid_cmd {
@@ -371,6 +427,11 @@ struct ksu_process_signal_cmd {
 #define KSU_IOCTL_VOLUME_KEY_STATE _IOWR('K', 31, struct ksu_volume_key_state_cmd)
 #define KSU_IOCTL_TOUCH_READER _IOWR('K', 32, struct ksu_touch_reader_cmd)
 #define KSU_IOCTL_MMAP_REMOTE _IOWR('K', 33, struct ksu_mmap_cmd)
+#define KSU_IOCTL_AUDIT _IOWR('K', 34, struct ksu_audit_cmd)
+#define KSU_IOCTL_HOOK_STATUS _IOWR('K', 35, struct ksu_hook_status_cmd)
+#define KSU_IOCTL_BREAKPOINT _IOWR('K', 36, struct ksu_breakpoint_cmd)
+#define KSU_IOCTL_MMAP_REMOTE_STATUS _IOWR('K', 37, struct ksu_mmap_status_cmd)
+#define KSU_IOCTL_MEM_RW_BATCH _IOWR('K', 38, struct ksu_mem_rw_batch_cmd)
 #define KSU_IOCTL_GET_HOOK_MODE _IOC(_IOC_READ, 'K', 98, 0)
 #define KSU_IOCTL_GET_VERSION_TAG _IOC(_IOC_READ, 'K', 99, 0)
 
