@@ -1054,6 +1054,427 @@ out:
     return ret;
 }
 
+static u64 ksu_count_i32_values(const void *buf, size_t len, s32 value)
+{
+    const s32 *values = buf;
+    size_t count = len / sizeof(*values);
+    size_t i;
+    u64 hits = 0;
+
+    for (i = 0; i < count; i++) {
+        if (values[i] == value)
+            hits++;
+    }
+
+    return hits;
+}
+
+static void ksu_scan_i32_values(const void *buf, size_t len, s32 value,
+                                unsigned long base_addr,
+                                struct ksu_scan_i32_cmd *cmd)
+{
+    const s32 *values = buf;
+    size_t count = len / sizeof(*values);
+    size_t i;
+
+    if (!cmd)
+        return;
+
+    for (i = 0; i < count; i++) {
+        if (values[i] != value)
+            continue;
+
+        if (cmd->hit_count < cmd->max_hits) {
+            cmd->hits[cmd->hit_count] =
+                (__u64)(base_addr + i * sizeof(*values));
+            cmd->hit_count++;
+        }
+        cmd->count++;
+    }
+}
+
+static bool ksu_scan_i32_clip_range(unsigned long *start,
+                                    unsigned long *end,
+                                    const struct ksu_scan_i32_cmd *cmd)
+{
+    if (!start || !end || !cmd || *end <= *start)
+        return false;
+
+    if (cmd->start && *end <= (unsigned long)cmd->start)
+        return false;
+    if (cmd->end && *start >= (unsigned long)cmd->end)
+        return false;
+
+    if (cmd->start && *start < (unsigned long)cmd->start)
+        *start = (unsigned long)cmd->start;
+    if (cmd->end && *end > (unsigned long)cmd->end)
+        *end = (unsigned long)cmd->end;
+
+    return *end > *start;
+}
+
+struct ksu_scan_vma_range {
+    unsigned long start;
+    unsigned long end;
+};
+
+static bool ksu_scan_vma_allowed(struct vm_area_struct *vma)
+{
+    vm_flags_t flags;
+
+    if (!vma || vma->vm_end <= vma->vm_start)
+        return false;
+
+    flags = vma->vm_flags;
+    if (!(flags & VM_READ))
+        return false;
+
+    if (flags & (VM_SPECIAL | VM_HUGETLB))
+        return false;
+
+    return true;
+}
+
+static int ksu_read_present_page_locked(struct mm_struct *mm,
+                                        unsigned long addr,
+                                        void *page_buf,
+                                        size_t len)
+{
+    struct vm_area_struct *vma;
+    struct page *page = NULL;
+    unsigned long offset;
+    size_t bytes;
+    void *kaddr;
+    int ret = 0;
+
+    if (!mm || !page_buf || !len)
+        return -EINVAL;
+
+    offset = addr & (PAGE_SIZE - 1);
+    bytes = min_t(size_t, len, PAGE_SIZE - offset);
+
+    vma = find_vma(mm, addr);
+    if (!vma || addr < vma->vm_start || !ksu_scan_vma_allowed(vma))
+        return 0;
+
+    if (addr + bytes > vma->vm_end)
+        bytes = vma->vm_end - addr;
+    if (!bytes)
+        return 0;
+
+    page = follow_page(vma, addr, FOLL_GET);
+    if (!page)
+        return 0;
+    if (IS_ERR(page)) {
+        ret = PTR_ERR(page);
+        page = NULL;
+    }
+
+    if (ret)
+        return ret;
+
+    kaddr = kmap(page);
+    memcpy(page_buf, (const char *)kaddr + offset, bytes);
+    kunmap(page);
+    put_page(page);
+
+    return bytes;
+}
+
+static int ksu_read_present_page(struct mm_struct *mm,
+                                 unsigned long addr,
+                                 void *page_buf,
+                                 size_t len)
+{
+    int ret;
+
+    mmap_read_lock(mm);
+    ret = ksu_read_present_page_locked(mm, addr, page_buf, len);
+    mmap_read_unlock(mm);
+
+    return ret;
+}
+
+static int ksu_collect_scan_vmas(struct mm_struct *mm,
+                                 struct ksu_scan_vma_range **out_ranges,
+                                 u32 *out_count)
+{
+    struct ksu_scan_vma_range *ranges;
+    struct vm_area_struct *vma;
+    u32 count = 0;
+    u32 written = 0;
+
+    if (!mm || !out_ranges || !out_count)
+        return -EINVAL;
+
+    *out_ranges = NULL;
+    *out_count = 0;
+
+    mmap_read_lock(mm);
+    for (vma = mm->mmap; vma; vma = vma->vm_next) {
+        if (ksu_scan_vma_allowed(vma))
+            count++;
+    }
+    mmap_read_unlock(mm);
+
+    if (!count)
+        return 0;
+    count = min_t(u32, count, 65536);
+
+    ranges = kvcalloc(count, sizeof(*ranges), GFP_KERNEL);
+    if (!ranges)
+        return -ENOMEM;
+
+    mmap_read_lock(mm);
+    for (vma = mm->mmap; vma && written < count; vma = vma->vm_next) {
+        if (!ksu_scan_vma_allowed(vma))
+            continue;
+
+        ranges[written].start = vma->vm_start;
+        ranges[written].end = vma->vm_end;
+        written++;
+    }
+    mmap_read_unlock(mm);
+
+    *out_ranges = ranges;
+    *out_count = written;
+    return 0;
+}
+
+static int do_scan_i32_count(void __user *arg)
+{
+    struct ksu_scan_i32_count_cmd cmd;
+    struct task_struct *task;
+    struct mm_struct *mm;
+    struct ksu_scan_vma_range *ranges = NULL;
+    void *page_buf;
+    u32 range_count = 0;
+    u32 i;
+    int ret = 0;
+    extern bool wksu_is_pid_hidden(int pid);
+
+    if (copy_from_user(&cmd, arg, sizeof(cmd)))
+        return -EFAULT;
+
+    if (cmd.pid <= 0)
+        return -EINVAL;
+
+    if (!wksu_is_pid_hidden(task_tgid_vnr(current)))
+        return -EACCES;
+
+    task = find_get_task_by_vpid(cmd.pid);
+    if (!task)
+        return -ESRCH;
+
+    mm = get_task_mm(task);
+    if (!mm) {
+        put_task_struct(task);
+        return -EINVAL;
+    }
+
+    page_buf = (void *)__get_free_page(GFP_KERNEL);
+    if (!page_buf) {
+        mmput(mm);
+        put_task_struct(task);
+        return -ENOMEM;
+    }
+
+    ret = ksu_collect_scan_vmas(mm, &ranges, &range_count);
+    if (ret)
+        goto out_free_page;
+
+    cmd.count = 0;
+    cmd.regions = 0;
+    cmd.bytes = 0;
+    cmd.failures = 0;
+    cmd.result = 0;
+
+    for (i = 0; i < range_count; i++) {
+        unsigned long addr;
+        unsigned long start = ranges[i].start;
+        unsigned long end = ranges[i].end;
+
+        addr = (start + (sizeof(s32) - 1)) & ~(unsigned long)(sizeof(s32) - 1);
+        if (addr >= end)
+            continue;
+
+        cmd.regions++;
+        while (addr + sizeof(s32) <= end) {
+            size_t request = min_t(size_t, PAGE_SIZE, end - addr);
+            size_t scan_size;
+            int accessed;
+
+            request &= ~(size_t)(sizeof(s32) - 1);
+            if (request < sizeof(s32))
+                break;
+
+            accessed = ksu_read_present_page(mm, addr, page_buf, request);
+            if (accessed < 0) {
+                cmd.failures++;
+                break;
+            }
+            if (accessed == 0) {
+                addr += request;
+                continue;
+            }
+
+            scan_size = ((size_t)accessed) & ~(size_t)(sizeof(s32) - 1);
+            if (scan_size >= sizeof(s32)) {
+                cmd.count += ksu_count_i32_values(page_buf, scan_size, cmd.value);
+                cmd.bytes += scan_size;
+            }
+
+            addr += request;
+        }
+    }
+
+    kvfree(ranges);
+out_free_page:
+    free_page((unsigned long)page_buf);
+    mmput(mm);
+    put_task_struct(task);
+
+    cmd.result = ret;
+    if (copy_to_user(arg, &cmd, sizeof(cmd)))
+        ret = -EFAULT;
+
+    return ret;
+}
+
+static int do_scan_i32(void __user *arg)
+{
+    struct ksu_scan_i32_cmd *cmd;
+    struct task_struct *task = NULL;
+    struct mm_struct *mm = NULL;
+    struct ksu_scan_vma_range *ranges = NULL;
+    void *page_buf = NULL;
+    u32 range_count = 0;
+    u32 i;
+    int ret = 0;
+    extern bool wksu_is_pid_hidden(int pid);
+
+    cmd = kvzalloc(sizeof(*cmd), GFP_KERNEL);
+    if (!cmd)
+        return -ENOMEM;
+
+    if (copy_from_user(cmd, arg, sizeof(*cmd))) {
+        ret = -EFAULT;
+        goto out;
+    }
+
+    if (cmd->pid <= 0 ||
+        cmd->start > ULONG_MAX ||
+        cmd->end > ULONG_MAX ||
+        (cmd->start && cmd->end && cmd->end <= cmd->start) ||
+        (cmd->flags & ~(KSU_SCAN_I32_F_STOP_ON_FULL |
+                        KSU_SCAN_I32_F_PRESENT_ONLY))) {
+        ret = -EINVAL;
+        goto copy_out;
+    }
+
+    if (!wksu_is_pid_hidden(task_tgid_vnr(current))) {
+        ret = -EACCES;
+        goto copy_out;
+    }
+
+    cmd->max_hits = min_t(u32, cmd->max_hits, KSU_SCAN_I32_MAX_HITS);
+    cmd->count = 0;
+    cmd->regions = 0;
+    cmd->bytes = 0;
+    cmd->failures = 0;
+    cmd->result = 0;
+    cmd->hit_count = 0;
+    memset(cmd->hits, 0, sizeof(cmd->hits));
+
+    task = find_get_task_by_vpid(cmd->pid);
+    if (!task) {
+        ret = -ESRCH;
+        goto copy_out;
+    }
+
+    mm = get_task_mm(task);
+    if (!mm) {
+        ret = -EINVAL;
+        goto copy_out;
+    }
+
+    page_buf = (void *)__get_free_page(GFP_KERNEL);
+    if (!page_buf) {
+        ret = -ENOMEM;
+        goto copy_out;
+    }
+
+    ret = ksu_collect_scan_vmas(mm, &ranges, &range_count);
+    if (ret)
+        goto copy_out;
+
+    for (i = 0; i < range_count; i++) {
+        unsigned long addr;
+        unsigned long start = ranges[i].start;
+        unsigned long end = ranges[i].end;
+
+        if (!ksu_scan_i32_clip_range(&start, &end, cmd))
+            continue;
+
+        addr = (start + (sizeof(s32) - 1)) &
+               ~(unsigned long)(sizeof(s32) - 1);
+        if (addr >= end)
+            continue;
+
+        cmd->regions++;
+        while (addr + sizeof(s32) <= end) {
+            size_t request = min_t(size_t, PAGE_SIZE, end - addr);
+            size_t scan_size;
+            int accessed;
+
+            request &= ~(size_t)(sizeof(s32) - 1);
+            if (request < sizeof(s32))
+                break;
+
+            accessed = ksu_read_present_page(mm, addr, page_buf, request);
+            if (accessed < 0) {
+                cmd->failures++;
+                break;
+            }
+            if (accessed == 0) {
+                addr += request;
+                continue;
+            }
+
+            scan_size = ((size_t)accessed) & ~(size_t)(sizeof(s32) - 1);
+            if (scan_size >= sizeof(s32)) {
+                ksu_scan_i32_values(page_buf, scan_size, cmd->value,
+                                    addr, cmd);
+                cmd->bytes += scan_size;
+            }
+
+            if ((cmd->flags & KSU_SCAN_I32_F_STOP_ON_FULL) &&
+                cmd->max_hits && cmd->hit_count >= cmd->max_hits)
+                goto copy_out;
+
+            addr += request;
+        }
+    }
+
+copy_out:
+    if (ranges)
+        kvfree(ranges);
+    if (page_buf)
+        free_page((unsigned long)page_buf);
+    if (mm)
+        mmput(mm);
+    if (task)
+        put_task_struct(task);
+
+    cmd->result = ret;
+    if (copy_to_user(arg, cmd, sizeof(*cmd)))
+        ret = -EFAULT;
+
+out:
+    kvfree(cmd);
+    return ret;
+}
+
 #define WKSU_MMAP_MAX_PAGES 262144
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
@@ -1946,32 +2367,38 @@ static int do_query_module(void __user *arg)
 	return cmd.found ? 0 : -ENOENT;
 }
 
-static pid_t lock_owner_pid = 0;
+static struct pid *lock_owner_pid;
 static DEFINE_MUTEX(instance_lock_mutex);
 
 static int do_instance_lock(void __user *arg)
 {
     struct ksu_instance_lock_cmd cmd;
-    pid_t current_pid = task_tgid_vnr(current);
+    struct pid *current_pid;
     int ret = 0;
 
     if (copy_from_user(&cmd, arg, sizeof(cmd)))
         return -EFAULT;
 
+    current_pid = get_task_pid(current, PIDTYPE_TGID);
+    if (!current_pid)
+        return -ESRCH;
+
     mutex_lock(&instance_lock_mutex);
 
     if (cmd.op == 1) { // Acquire
-        if (lock_owner_pid == 0) {
-            // No owner, acquire directly
+        if (!lock_owner_pid) {
             lock_owner_pid = current_pid;
+            current_pid = NULL;
             ret = 0;
         } else if (lock_owner_pid == current_pid) {
             // Already owned by current process (idempotent)
             ret = 0;
         } else {
-            struct task_struct *task = find_get_task_by_vpid(lock_owner_pid);
+            struct task_struct *task = get_pid_task(lock_owner_pid, PIDTYPE_TGID);
             if (!task) {
+                put_pid(lock_owner_pid);
                 lock_owner_pid = current_pid;
+                current_pid = NULL;
                 ret = 0;
             } else {
                 put_task_struct(task);
@@ -1980,7 +2407,8 @@ static int do_instance_lock(void __user *arg)
         }
     } else if (cmd.op == 0) { // Release
         if (lock_owner_pid == current_pid) {
-            lock_owner_pid = 0;
+            put_pid(lock_owner_pid);
+            lock_owner_pid = NULL;
             ret = 0;
         } else {
             ret = -EPERM;
@@ -1990,6 +2418,8 @@ static int do_instance_lock(void __user *arg)
     }
 
     mutex_unlock(&instance_lock_mutex);
+    if (current_pid)
+        put_pid(current_pid);
     return ret;
 }
 
@@ -2117,8 +2547,6 @@ static bool ksu_copy_anon_vma_name(struct mm_struct *mm, struct vm_area_struct *
 					  char *out, size_t out_size)
 {
 	const char __user *name = vma_get_anon_name(vma);
-	unsigned long page_start_vaddr;
-	unsigned long page_offset;
 	unsigned long max_len;
 	size_t written = 0;
 
@@ -2126,36 +2554,32 @@ static bool ksu_copy_anon_vma_name(struct mm_struct *mm, struct vm_area_struct *
 		return false;
 
 	out[0] = '\0';
-	page_start_vaddr = (unsigned long)name & PAGE_MASK;
-	page_offset = (unsigned long)name - page_start_vaddr;
 	max_len = min_t(unsigned long, NAME_MAX, out_size - 1);
 
 	while (max_len > 0) {
-		struct page *page;
-		const char *kaddr;
-		long pinned;
-		int len;
+		char tmp[NAME_MAX + 1];
+		unsigned long addr = (unsigned long)name + written;
+		unsigned long page_left = PAGE_SIZE - (addr & (PAGE_SIZE - 1));
+		size_t request;
+		int accessed;
 		int copy_len;
 
-		pinned = get_user_pages_remote(mm, page_start_vaddr, 1, 0, &page, NULL, NULL);
-		if (pinned < 1)
+		request = min_t(unsigned long, max_len, page_left);
+		request = min_t(size_t, request, sizeof(tmp));
+
+		accessed = ksu_read_present_page_locked(mm, addr, tmp, request);
+		if (accessed <= 0)
 			break;
 
-		kaddr = (const char *)kmap(page);
-		len = min_t(unsigned long, max_len, PAGE_SIZE - page_offset);
-		copy_len = strnlen(kaddr + page_offset, len);
-		memcpy(out + written, kaddr + page_offset, copy_len);
-		kunmap(page);
-		put_user_page(page);
+		copy_len = strnlen(tmp, accessed);
+		memcpy(out + written, tmp, copy_len);
 
 		written += copy_len;
 		out[written] = '\0';
-		if (copy_len != len)
-			return true;
+		if (copy_len != accessed)
+			return written > 0;
 
-		max_len -= len;
-		page_offset = 0;
-		page_start_vaddr += PAGE_SIZE;
+		max_len -= copy_len;
 	}
 
 	out[written] = '\0';
@@ -3215,11 +3639,12 @@ static int do_process_signal(void __user *arg)
 	if (!valid_signal(sig))
 		return -EINVAL;
 
-	pid = find_vpid(cmd.pid);
+	pid = find_get_pid(cmd.pid);
 	if (!pid)
 		return -ESRCH;
 
 	ret = kill_pid(pid, sig, 1);
+	put_pid(pid);
 	cmd.signal = sig;
 	cmd.result = ret;
 
@@ -3322,6 +3747,14 @@ static const struct ksu_ioctl_cmd_map ksu_ioctl_handlers[] = {
     { .cmd = KSU_IOCTL_MEM_RW_BATCH,
       .name = "MEM_RW_BATCH",
       .handler = do_mem_rw_batch,
+      .perm_check = manager_or_root },
+    { .cmd = KSU_IOCTL_SCAN_I32_COUNT,
+      .name = "SCAN_I32_COUNT",
+      .handler = do_scan_i32_count,
+      .perm_check = manager_or_root },
+    { .cmd = KSU_IOCTL_SCAN_I32,
+      .name = "SCAN_I32",
+      .handler = do_scan_i32,
       .perm_check = manager_or_root },
     { .cmd = KSU_IOCTL_MMAP_REMOTE,
       .name = "MMAP_REMOTE",
@@ -3817,6 +4250,13 @@ void ksu_supercalls_exit(void)
     mutex_lock(&ksu_input_inject_mutex);
     ksu_input_inject_close_locked();
     mutex_unlock(&ksu_input_inject_mutex);
+
+    mutex_lock(&instance_lock_mutex);
+    if (lock_owner_pid) {
+        put_pid(lock_owner_pid);
+        lock_owner_pid = NULL;
+    }
+    mutex_unlock(&instance_lock_mutex);
 
 #ifndef CONFIG_KSU_SUSFS
     unregister_kprobe(&reboot_kp);

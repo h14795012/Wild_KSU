@@ -451,8 +451,8 @@ static int wksu_breakpoint_add(s32 pid, u64 addr, u32 len, u32 type,
 {
 	struct task_struct **tasks;
 	struct wksu_breakpoint *bp;
-	struct perf_event *events[WKSU_BREAKPOINT_MAX_TARGETS] = { 0 };
-	pid_t event_pids[WKSU_BREAKPOINT_MAX_TARGETS] = { 0 };
+	struct perf_event **events;
+	pid_t *event_pids;
 	u32 task_count = 0;
 	u32 event_count = 0;
 	s32 target_pid = 0;
@@ -475,6 +475,21 @@ static int wksu_breakpoint_add(s32 pid, u64 addr, u32 len, u32 type,
 			GFP_KERNEL);
 	if (!tasks)
 		return -ENOMEM;
+
+	events = kcalloc(WKSU_BREAKPOINT_MAX_TARGETS, sizeof(*events),
+			 GFP_KERNEL);
+	if (!events) {
+		kfree(tasks);
+		return -ENOMEM;
+	}
+
+	event_pids = kcalloc(WKSU_BREAKPOINT_MAX_TARGETS,
+			    sizeof(*event_pids), GFP_KERNEL);
+	if (!event_pids) {
+		kfree(events);
+		kfree(tasks);
+		return -ENOMEM;
+	}
 
 	ret = wksu_breakpoint_collect_tasks(pid, flags, tasks, &task_count,
 					   &target_pid, &target_tgid);
@@ -535,6 +550,8 @@ out_unlock:
 out_tasks:
 	for (i = 0; i < task_count; i++)
 		put_task_struct(tasks[i]);
+	kfree(event_pids);
+	kfree(events);
 	kfree(tasks);
 	return ret;
 }
@@ -597,9 +614,9 @@ static int wksu_breakpoint_refresh_one(u32 id)
 	struct task_struct **tasks;
 	struct task_struct **missing_tasks;
 	struct wksu_breakpoint *bp;
-	struct perf_event *events[WKSU_BREAKPOINT_MAX_TARGETS] = { 0 };
-	struct perf_event *stale_events[WKSU_BREAKPOINT_MAX_TARGETS] = { 0 };
-	pid_t event_pids[WKSU_BREAKPOINT_MAX_TARGETS] = { 0 };
+	struct perf_event **events;
+	struct perf_event **stale_events;
+	pid_t *event_pids;
 	u32 task_count = 0;
 	u32 missing_count = 0;
 	u32 event_count = 0;
@@ -625,6 +642,33 @@ static int wksu_breakpoint_refresh_one(u32 id)
 	missing_tasks = kcalloc(WKSU_BREAKPOINT_MAX_TARGETS,
 				sizeof(*missing_tasks), GFP_KERNEL);
 	if (!missing_tasks) {
+		kfree(tasks);
+		return -ENOMEM;
+	}
+
+	events = kcalloc(WKSU_BREAKPOINT_MAX_TARGETS, sizeof(*events),
+			 GFP_KERNEL);
+	if (!events) {
+		kfree(missing_tasks);
+		kfree(tasks);
+		return -ENOMEM;
+	}
+
+	stale_events = kcalloc(WKSU_BREAKPOINT_MAX_TARGETS,
+			       sizeof(*stale_events), GFP_KERNEL);
+	if (!stale_events) {
+		kfree(events);
+		kfree(missing_tasks);
+		kfree(tasks);
+		return -ENOMEM;
+	}
+
+	event_pids = kcalloc(WKSU_BREAKPOINT_MAX_TARGETS,
+			    sizeof(*event_pids), GFP_KERNEL);
+	if (!event_pids) {
+		kfree(stale_events);
+		kfree(events);
+		kfree(missing_tasks);
 		kfree(tasks);
 		return -ENOMEM;
 	}
@@ -708,12 +752,18 @@ out_unlock:
 out_tasks:
 	for (i = 0; i < task_count; i++)
 		put_task_struct(tasks[i]);
+	kfree(event_pids);
+	kfree(stale_events);
+	kfree(events);
 	kfree(missing_tasks);
 	kfree(tasks);
 	return ret;
 
 out_unlock_no_tasks:
 	mutex_unlock(&wksu_breakpoint_lock);
+	kfree(event_pids);
+	kfree(stale_events);
+	kfree(events);
 	kfree(missing_tasks);
 	kfree(tasks);
 	return ret;

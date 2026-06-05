@@ -66,8 +66,10 @@ static void susfs_handle_setuid_tw_func(struct callback_head *cb)
 
 static void ksu_handle_extra_susfs_work(void)
 {
-    struct susfs_handle_setuid_tw *tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
+    struct susfs_handle_setuid_tw *tw;
+    int err;
 
+    tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
     if (!tw) {
         pr_err("susfs: No enough memory\n");
         return;
@@ -75,7 +77,7 @@ static void ksu_handle_extra_susfs_work(void)
 
     tw->cb.func = susfs_handle_setuid_tw_func;
 
-    int err = task_work_add(current, &tw->cb, TWA_RESUME);
+    err = task_work_add(current, &tw->cb, TWA_RESUME);
     if (err) {
         kfree(tw);
         pr_err("susfs: Failed adding task_work 'susfs_handle_setuid_tw', err: %d\n", err);
@@ -100,13 +102,15 @@ int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid)
 
     if (likely(ksu_is_manager_appid_valid()) &&
         unlikely(ksu_get_manager_appid() == new_uid % PER_USER_RANGE)) {
+        struct callback_head *cb;
+
         spin_lock_irq(&current->sighand->siglock);
         ksu_seccomp_allow_cache(current->seccomp.filter, __NR_reboot);
         ksu_set_task_tracepoint_flag(current);
         spin_unlock_irq(&current->sighand->siglock);
 
         pr_info("install fd for manager: %d\n", new_uid);
-        struct callback_head *cb = kzalloc(sizeof(*cb), GFP_ATOMIC);
+        cb = kzalloc(sizeof(*cb), GFP_ATOMIC);
         if (!cb)
             return 0;
         cb->func = ksu_install_manager_fd_tw_func;
@@ -157,12 +161,14 @@ int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid){
     //   ksu manager
     if (likely(ksu_is_manager_appid_valid()) &&
         unlikely(ksu_get_manager_appid() == new_uid % PER_USER_RANGE)) {
+        struct callback_head *cb;
+
         spin_lock_irq(&current->sighand->siglock);
         ksu_seccomp_allow_cache(current->seccomp.filter, __NR_reboot);
         spin_unlock_irq(&current->sighand->siglock);
 
         pr_info("install fd for manager: %d\n", new_uid);
-        struct callback_head *cb = kzalloc(sizeof(*cb), GFP_ATOMIC);
+        cb = kzalloc(sizeof(*cb), GFP_ATOMIC);
         if (!cb)
             return 0;
         cb->func = ksu_install_manager_fd_tw_func;

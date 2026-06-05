@@ -388,6 +388,36 @@ struct ksu_process_signal_cmd {
     __s32 result;
 };
 
+struct ksu_scan_i32_count_cmd {
+    __s32 pid;
+    __s32 value;
+    __u64 count;
+    __u64 regions;
+    __u64 bytes;
+    __u64 failures;
+    __s32 result;
+};
+
+#define KSU_SCAN_I32_MAX_HITS 64
+#define KSU_SCAN_I32_F_STOP_ON_FULL (1U << 0)
+#define KSU_SCAN_I32_F_PRESENT_ONLY (1U << 1)
+
+struct ksu_scan_i32_cmd {
+    __s32 pid;
+    __s32 value;
+    __u64 start;
+    __u64 end;
+    __u32 max_hits;
+    __u32 flags;
+    __u64 count;
+    __u64 regions;
+    __u64 bytes;
+    __u64 failures;
+    __s32 result;
+    __u32 hit_count;
+    __u64 hits[KSU_SCAN_I32_MAX_HITS];
+};
+
 // IOCTL command definitions
 #define KSU_IOCTL_GRANT_ROOT _IOC(_IOC_NONE, 'K', 1, 0)
 #define KSU_IOCTL_GET_INFO _IOC(_IOC_READ, 'K', 2, 0)
@@ -432,6 +462,8 @@ struct ksu_process_signal_cmd {
 #define KSU_IOCTL_BREAKPOINT _IOWR('K', 36, struct ksu_breakpoint_cmd)
 #define KSU_IOCTL_MMAP_REMOTE_STATUS _IOWR('K', 37, struct ksu_mmap_status_cmd)
 #define KSU_IOCTL_MEM_RW_BATCH _IOWR('K', 38, struct ksu_mem_rw_batch_cmd)
+#define KSU_IOCTL_SCAN_I32_COUNT _IOWR('K', 39, struct ksu_scan_i32_count_cmd)
+#define KSU_IOCTL_SCAN_I32 _IOWR('K', 40, struct ksu_scan_i32_cmd)
 #define KSU_IOCTL_GET_HOOK_MODE _IOC(_IOC_READ, 'K', 98, 0)
 #define KSU_IOCTL_GET_VERSION_TAG _IOC(_IOC_READ, 'K', 99, 0)
 

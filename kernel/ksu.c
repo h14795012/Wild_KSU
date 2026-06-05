@@ -4,6 +4,7 @@
 #include <linux/kobject.h>
 #include <linux/module.h>
 #include <linux/sched.h>
+#include <linux/sched/signal.h>
 #include <linux/workqueue.h>
 #ifdef CONFIG_KSU_SUSFS
 #include <linux/susfs.h>
@@ -71,29 +72,75 @@ EXPORT_SYMBOL_GPL(wksu_hidden_pid_count);
 
 // PID Hiding Logic for Step 4
 #include <linux/hashtable.h>
+#define WKSU_HIDE_MANUAL (1U << 0)
 static DEFINE_HASHTABLE(wksu_hidden_pids, 8);
 static DEFINE_SPINLOCK(wksu_pid_lock);
 struct wksu_pid_node {
     int pid;
+    u64 start_time;
+    unsigned int reasons;
     struct hlist_node node;
     struct rcu_head rcu;
 };
 
-bool wksu_is_pid_hidden(int pid) {
+static u64 wksu_task_start_time(struct task_struct *task)
+{
+    return task ? READ_ONCE(task->start_time) : 0;
+}
+
+static u64 wksu_pid_start_time(int pid)
+{
+    struct task_struct *task;
+    u64 start_time = 0;
+
+    if (pid <= 0)
+        return 0;
+
+    rcu_read_lock();
+    task = find_task_by_vpid(pid);
+    if (task)
+        start_time = wksu_task_start_time(task);
+    rcu_read_unlock();
+
+    return start_time;
+}
+
+static unsigned int wksu_pid_hidden_reasons(int pid)
+{
     struct wksu_pid_node *node;
-    bool found = false;
+    struct task_struct *task;
+    u64 start_time = 0;
+    unsigned int reasons = 0;
+
     if (pid <= 0) return false;
     rcu_read_lock();
+    task = find_task_by_vpid(pid);
+    if (task)
+        start_time = wksu_task_start_time(task);
+    if (!start_time)
+        goto out;
     hash_for_each_possible_rcu(wksu_hidden_pids, node, node, pid) {
-        if (node->pid == pid) {
-            found = true;
+        if (node->pid == pid && node->start_time == start_time &&
+            node->reasons) {
+            reasons = node->reasons;
             break;
         }
     }
+out:
     rcu_read_unlock();
-    return found;
+    return reasons;
+}
+
+bool wksu_is_pid_hidden(int pid) {
+    return wksu_pid_hidden_reasons(pid) != 0;
 }
 EXPORT_SYMBOL_GPL(wksu_is_pid_hidden);
+
+bool wksu_should_hide_pid(int pid)
+{
+    return wksu_is_pid_hidden(pid);
+}
+EXPORT_SYMBOL_GPL(wksu_should_hide_pid);
 
 void wksu_get_hidden_stats(int *running, int *total_threads) {
     struct wksu_pid_node *node;
@@ -103,7 +150,7 @@ void wksu_get_hidden_stats(int *running, int *total_threads) {
     rcu_read_lock();
     hash_for_each_rcu(wksu_hidden_pids, bkt, node, node) {
         struct task_struct *task = find_task_by_vpid(node->pid);
-        if (task) {
+        if (task && wksu_task_start_time(task) == node->start_time) {
             if (READ_ONCE(task->state) == TASK_RUNNING)
                 r++;
             t += get_nr_threads(task);
@@ -117,43 +164,92 @@ void wksu_get_hidden_stats(int *running, int *total_threads) {
 EXPORT_SYMBOL_GPL(wksu_get_hidden_stats);
 
 // Helper to add/remove hidden PID
-void wksu_set_pid_hidden(int pid, bool hide) {
+void wksu_set_pid_hidden_reason(int pid, unsigned int reason, bool hide) {
     struct wksu_pid_node *node;
+    struct hlist_node *hnode;
     struct wksu_pid_node *tmp = NULL;
     unsigned long flags;
+    u64 start_time;
     bool found = false;
 
-    if (pid <= 0) return;
+    if (pid <= 0 || !reason) return;
+    start_time = wksu_pid_start_time(pid);
+    if (!start_time) return;
 
     spin_lock_irqsave(&wksu_pid_lock, flags);
     
-    hash_for_each_possible(wksu_hidden_pids, node, node, pid) {
-        if (node->pid == pid) {
-            found = true;
-            tmp = node;
-            break;
+    hash_for_each_possible_safe(wksu_hidden_pids, node, hnode, node, pid) {
+        if (node->pid != pid)
+            continue;
+        if (node->start_time != start_time) {
+            hash_del_rcu(&node->node);
+            kfree_rcu(node, rcu);
+            atomic_dec(&wksu_hidden_pid_count);
+            continue;
         }
+        found = true;
+        tmp = node;
+        break;
     }
 
     if (hide) {
-        if (!found) {
+        if (found) {
+            tmp->reasons |= reason;
+        } else {
             node = kmalloc(sizeof(*node), GFP_ATOMIC);
             if (node) {
                 node->pid = pid;
+                node->start_time = start_time;
+                node->reasons = reason;
                 hash_add_rcu(wksu_hidden_pids, &node->node, pid);
                 atomic_inc(&wksu_hidden_pid_count);
             }
         }
     } else {
         if (found && tmp) {
-            hash_del_rcu(&tmp->node);
-            kfree_rcu(tmp, rcu);
-            atomic_dec(&wksu_hidden_pid_count);
+            tmp->reasons &= ~reason;
+            if (!tmp->reasons) {
+                hash_del_rcu(&tmp->node);
+                kfree_rcu(tmp, rcu);
+                atomic_dec(&wksu_hidden_pid_count);
+            }
         }
     }
     spin_unlock_irqrestore(&wksu_pid_lock, flags);
 }
+EXPORT_SYMBOL_GPL(wksu_set_pid_hidden_reason);
+
+void wksu_set_pid_hidden(int pid, bool hide) {
+    wksu_set_pid_hidden_reason(pid, WKSU_HIDE_MANUAL, hide);
+}
 EXPORT_SYMBOL_GPL(wksu_set_pid_hidden);
+
+void wksu_prune_hidden_pids(void)
+{
+    struct wksu_pid_node *node;
+    struct hlist_node *tmp;
+    unsigned long flags;
+    int bkt;
+
+    spin_lock_irqsave(&wksu_pid_lock, flags);
+    hash_for_each_safe(wksu_hidden_pids, bkt, tmp, node, node) {
+        struct task_struct *task;
+
+        rcu_read_lock();
+        task = find_task_by_vpid(node->pid);
+        if (task && wksu_task_start_time(task) != node->start_time)
+            task = NULL;
+        rcu_read_unlock();
+        if (task)
+            continue;
+
+        hash_del_rcu(&node->node);
+        kfree_rcu(node, rcu);
+        atomic_dec(&wksu_hidden_pid_count);
+    }
+    spin_unlock_irqrestore(&wksu_pid_lock, flags);
+}
+EXPORT_SYMBOL_GPL(wksu_prune_hidden_pids);
 
 int __init kernelsu_init(void)
 {
