@@ -22,6 +22,8 @@
 #include <linux/input/mt.h>
 #include <linux/highmem.h>
 #include <linux/bitmap.h>
+#include <linux/build_bug.h>
+#include <linux/overflow.h>
 #include <trace/events/oom.h>
 #include <linux/dcache.h>
 #include <linux/sched/task.h>
@@ -797,17 +799,39 @@ static int do_manage_pid_hide(void __user *arg)
     return 0;
 }
 
+#define WKSU_MEM_RW_MAX_LEN  (64U * 1024U * 1024U)
+#define WKSU_USER_ADDR_MASK  0x00ffffffffffffffULL
+#define WKSU_USER_ADDR_MIN   0x0000000001000000ULL
+#define WKSU_USER_ADDR_MAX   0x0000007fffffffffULL
+
 static int do_mem_rw(void __user *arg)
 {
     struct ksu_mem_rw_cmd cmd;
     struct task_struct *task;
     void *page_buf;
+    __u64 remote_end;
+    __u64 user_end;
     int ret = 0;
-    extern bool wksu_is_pid_hidden(int pid);
 
     if (copy_from_user(&cmd, arg, sizeof(cmd))) {
         return -EFAULT;
     }
+
+    if (cmd.pid <= 0 || !cmd.addr || !cmd.buf || !cmd.len ||
+        cmd.len > WKSU_MEM_RW_MAX_LEN || cmd.write > 1)
+        return -EINVAL;
+
+    cmd.addr &= WKSU_USER_ADDR_MASK;
+    if (cmd.addr < WKSU_USER_ADDR_MIN || cmd.addr > WKSU_USER_ADDR_MAX)
+        return -EFAULT;
+
+    if (check_add_overflow(cmd.addr, (__u64)cmd.len - 1, &remote_end) ||
+        check_add_overflow(cmd.buf, (__u64)cmd.len - 1, &user_end))
+        return -EOVERFLOW;
+    if (remote_end > WKSU_USER_ADDR_MAX ||
+        !access_ok((void __user *)(unsigned long)cmd.buf, cmd.len) ||
+        !access_ok((void __user *)(unsigned long)user_end, 1))
+        return -EFAULT;
 
     // Scope restriction: only allow hidden caller processes to use MEM_RW.
     if (!wksu_is_pid_hidden(task_tgid_vnr(current))) {
@@ -849,12 +873,311 @@ static int do_mem_rw(void __user *arg)
         cmd.addr += bytes;
         cmd.buf += bytes;
         cmd.len -= bytes;
+        cond_resched();
     }
 
     free_page((unsigned long)page_buf);
     put_task_struct(task);
     return ret;
 }
+
+static int wksu_normalize_remote_addr(__u64 raw_addr, __u64 *normalized)
+{
+    __u64 addr;
+
+    if (!normalized)
+        return -EINVAL;
+
+    addr = raw_addr & WKSU_USER_ADDR_MASK;
+    if (addr < WKSU_USER_ADDR_MIN || addr > WKSU_USER_ADDR_MAX)
+        return -EFAULT;
+
+    *normalized = addr;
+    return 0;
+}
+
+static int wksu_add_remote_offset(__u64 base, __s64 offset, __u64 *result)
+{
+    __u64 address;
+    __u64 magnitude;
+
+    if (!result)
+        return -EINVAL;
+
+    if (offset >= 0) {
+        if (check_add_overflow(base, (__u64)offset, &address))
+            return -EOVERFLOW;
+    } else {
+        magnitude = (__u64)(-(offset + 1)) + 1;
+        if (base < magnitude)
+            return -EOVERFLOW;
+        address = base - magnitude;
+    }
+
+    if (address < WKSU_USER_ADDR_MIN || address > WKSU_USER_ADDR_MAX)
+        return -EFAULT;
+
+    *result = address;
+    return 0;
+}
+
+static int wksu_validate_remote_range(__u64 address, __u32 len)
+{
+    __u64 end;
+
+    if (!len)
+        return -EINVAL;
+
+    if (address < WKSU_USER_ADDR_MIN || address > WKSU_USER_ADDR_MAX)
+        return -EFAULT;
+
+    if (check_add_overflow(address, (__u64)len - 1, &end) ||
+        end > WKSU_USER_ADDR_MAX)
+        return -EFAULT;
+
+    return 0;
+}
+
+static int wksu_read_remote_u64(struct task_struct *task, __u64 address,
+                                __u64 *value)
+{
+    int transferred;
+    int ret;
+
+    if (!task || !value)
+        return -EINVAL;
+
+    ret = wksu_validate_remote_range(address, sizeof(*value));
+    if (ret)
+        return ret;
+
+    transferred = access_process_vm(task, (unsigned long)address, value,
+                                    sizeof(*value), FOLL_FORCE);
+    if (transferred != sizeof(*value))
+        return transferred < 0 ? transferred : -EIO;
+
+    return 0;
+}
+
+static int wksu_transfer_remote(struct task_struct *task, __u64 remote_addr,
+                                __u64 user_buf, __u32 len, bool write,
+                                void *page_buf, __u32 *out_done)
+{
+    __u32 done = 0;
+    int ret = -EIO;
+
+    if (!task || !user_buf || !page_buf || !out_done)
+        return -EINVAL;
+
+    ret = wksu_validate_remote_range(remote_addr, len);
+    if (ret)
+        return ret;
+
+    if (!access_ok((void __user *)(unsigned long)user_buf, len))
+        return -EFAULT;
+
+    while (done < len) {
+        size_t requested = min_t(size_t, len - done, PAGE_SIZE);
+        __u64 current_remote;
+        __u64 current_user;
+        int transferred;
+
+        if (check_add_overflow(remote_addr, (__u64)done, &current_remote) ||
+            check_add_overflow(user_buf, (__u64)done, &current_user)) {
+            ret = -EOVERFLOW;
+            break;
+        }
+
+        if (write) {
+            if (copy_from_user(page_buf,
+                               (void __user *)(unsigned long)current_user,
+                               requested)) {
+                ret = -EFAULT;
+                break;
+            }
+            transferred = access_process_vm(task,
+                                            (unsigned long)current_remote,
+                                            page_buf, requested,
+                                            FOLL_FORCE | FOLL_WRITE);
+        } else {
+            transferred = access_process_vm(task,
+                                            (unsigned long)current_remote,
+                                            page_buf, requested, FOLL_FORCE);
+            if (transferred > 0 &&
+                copy_to_user((void __user *)(unsigned long)current_user,
+                             page_buf, transferred)) {
+                ret = -EFAULT;
+                break;
+            }
+        }
+
+        if (transferred <= 0) {
+            ret = transferred < 0 ? transferred : -EIO;
+            break;
+        }
+
+        done += transferred;
+        if (transferred != requested) {
+            ret = -EIO;
+            break;
+        }
+    }
+
+    *out_done = done;
+    return done == len ? 0 : ret;
+}
+
+static int wksu_execute_mem_op(struct task_struct *task,
+                               struct wksu_mem_op *op, void *page_buf)
+{
+    __u64 chain_addr;
+    __u64 target;
+    __u64 pointer_address;
+    __u64 next_addr;
+    __u32 done = 0;
+    __u32 depth;
+    int ret;
+
+    op->status = -EINVAL;
+    op->done = 0;
+
+    if (!op->len || op->len > WKSU_MEM_OP_MAX_LEN ||
+        op->ptr_depth > WKSU_MEM_OP_MAX_PTR_DEPTH || !op->buf)
+        return op->status;
+
+    switch (op->op) {
+    case WKSU_MEM_OP_READ_ABS:
+    case WKSU_MEM_OP_WRITE_ABS:
+        if (op->ptr_depth) {
+            ret = -EINVAL;
+            break;
+        }
+        ret = wksu_normalize_remote_addr(op->addr, &target);
+        if (ret)
+            break;
+        ret = wksu_transfer_remote(task, target, op->buf, op->len,
+                                   op->op == WKSU_MEM_OP_WRITE_ABS,
+                                   page_buf, &done);
+        break;
+
+    case WKSU_MEM_OP_READ_CHAIN:
+        ret = wksu_normalize_remote_addr(op->addr, &chain_addr);
+        if (ret)
+            break;
+
+        for (depth = 0; depth < op->ptr_depth; depth++) {
+            ret = wksu_add_remote_offset(chain_addr, op->offsets[depth],
+                                         &pointer_address);
+            if (ret)
+                break;
+            ret = wksu_read_remote_u64(task, pointer_address, &next_addr);
+            if (ret)
+                break;
+            ret = wksu_normalize_remote_addr(next_addr, &chain_addr);
+            if (ret)
+                break;
+        }
+        if (ret)
+            break;
+
+        ret = wksu_add_remote_offset(chain_addr, op->final_offset, &target);
+        if (ret)
+            break;
+        ret = wksu_transfer_remote(task, target, op->buf, op->len, false,
+                                   page_buf, &done);
+        break;
+
+    default:
+        ret = -EINVAL;
+        break;
+    }
+
+    op->done = done;
+    op->status = ret;
+    return ret;
+}
+
+static int do_mem_ops(void __user *arg)
+{
+    struct wksu_mem_ops_cmd cmd;
+    struct wksu_mem_op *ops;
+    struct task_struct *task;
+    void *page_buf;
+    size_t ops_size;
+    __u32 completed = 0;
+    __u32 i;
+    int first_error = 0;
+    int ret = 0;
+
+    BUILD_BUG_ON(sizeof(struct wksu_mem_op) != 104);
+    BUILD_BUG_ON(offsetof(struct wksu_mem_op, offsets) != 16);
+    BUILD_BUG_ON(offsetof(struct wksu_mem_op, final_offset) != 80);
+    BUILD_BUG_ON(offsetof(struct wksu_mem_op, buf) != 88);
+    BUILD_BUG_ON(offsetof(struct wksu_mem_op, status) != 96);
+    BUILD_BUG_ON(offsetof(struct wksu_mem_op, done) != 100);
+    BUILD_BUG_ON(sizeof(struct wksu_mem_ops_cmd) != 32);
+    BUILD_BUG_ON(offsetof(struct wksu_mem_ops_cmd, ops) != 16);
+    BUILD_BUG_ON(offsetof(struct wksu_mem_ops_cmd, first_error) != 24);
+    BUILD_BUG_ON(offsetof(struct wksu_mem_ops_cmd, completed) != 28);
+    BUILD_BUG_ON(_IOC_TYPE(KSU_IOCTL_MEM_OPS_V1) != 'K');
+    BUILD_BUG_ON(_IOC_NR(KSU_IOCTL_MEM_OPS_V1) != 33);
+    BUILD_BUG_ON(_IOC_SIZE(KSU_IOCTL_MEM_OPS_V1) != sizeof(cmd));
+
+    if (copy_from_user(&cmd, arg, sizeof(cmd)))
+        return -EFAULT;
+
+    if (cmd.version != WKSU_MEM_OPS_VERSION || cmd.size != sizeof(cmd) ||
+        cmd.pid <= 0 || !cmd.ops || !cmd.count ||
+        cmd.count > WKSU_MEM_OP_MAX_COUNT)
+        return -EINVAL;
+
+    if (!wksu_is_pid_hidden(task_tgid_vnr(current)))
+        return -EACCES;
+
+    if (check_mul_overflow((size_t)cmd.count, sizeof(*ops), &ops_size))
+        return -EOVERFLOW;
+
+    ops = memdup_user((void __user *)(unsigned long)cmd.ops, ops_size);
+    if (IS_ERR(ops))
+        return PTR_ERR(ops);
+
+    task = find_get_task_by_vpid(cmd.pid);
+    if (!task) {
+        ret = -ESRCH;
+        goto out_free_ops;
+    }
+
+    page_buf = (void *)__get_free_page(GFP_KERNEL);
+    if (!page_buf) {
+        ret = -ENOMEM;
+        goto out_put_task;
+    }
+
+    for (i = 0; i < cmd.count; i++) {
+        int op_ret = wksu_execute_mem_op(task, &ops[i], page_buf);
+
+        if (!op_ret)
+            completed++;
+        else if (!first_error)
+            first_error = op_ret;
+        cond_resched();
+    }
+
+    cmd.first_error = first_error;
+    cmd.completed = completed;
+
+    if (copy_to_user((void __user *)(unsigned long)cmd.ops, ops, ops_size) ||
+        copy_to_user(arg, &cmd, sizeof(cmd)))
+        ret = -EFAULT;
+
+    free_page((unsigned long)page_buf);
+out_put_task:
+    put_task_struct(task);
+out_free_ops:
+    kfree(ops);
+    return ret;
+}
+
 static bool ksu_process_name_matches(const char *candidate,
                                      size_t candidate_len,
                                      const char *target,
@@ -2480,6 +2803,10 @@ static const struct ksu_ioctl_cmd_map ksu_ioctl_handlers[] = {
     { .cmd = KSU_IOCTL_TOUCH_READER,
       .name = "TOUCH_READER",
       .handler = do_touch_reader,
+      .perm_check = manager_or_root },
+    { .cmd = KSU_IOCTL_MEM_OPS_V1,
+      .name = "MEM_OPS_V1",
+      .handler = do_mem_ops,
       .perm_check = manager_or_root },
     { .cmd = KSU_IOCTL_GET_HOOK_MODE,
       .name = "GET_HOOK_MODE",

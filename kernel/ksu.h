@@ -28,5 +28,6 @@ static inline int endswith(const char *s, const char *t)
 
 extern struct cred *ksu_cred;
 extern bool ksu_late_loaded;
+bool wksu_is_pid_hidden(int pid);
 
 #endif
