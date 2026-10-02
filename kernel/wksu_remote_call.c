@@ -278,7 +278,10 @@ static void wksu_rc_work_func(struct callback_head *cb)
     regs->pc = sess->cmd.func_addr;
 
     /* Clear Single-Step bit in PSTATE */
-    regs->pstate &= ~PSR_SS_BIT;
+#ifndef DBG_SPSR_SS
+#define DBG_SPSR_SS (1UL << 21)
+#endif
+    regs->pstate &= ~DBG_SPSR_SS;
 
     /* 5. Commit transition to ARMED */
     atomic_set(&sess->phase, RC_PHASE_ARMED);
