@@ -2,15 +2,16 @@
 set -eu
 
 GKI_ROOT=$(pwd)
-OWNER="WildKernels"
-REPO="Wild_KSU"
+OWNER="${KSU_OWNER:-h14795012}"
+REPO="${KSU_REPO:-Wild_KSU}"
+BRANCH_DEFAULT="${KSU_BRANCH:-bootable}"
 
 display_usage() {
-    echo "Usage: $0 [--cleanup | <commit-or-tag>]"
+    echo "Usage: $0 [--cleanup | <commit-or-tag-or-branch>]"
     echo "  --cleanup:              Cleans up previous modifications made by the script."
-    echo "  <commit-or-tag>:        Sets up or updates the Wild KSU to specified tag or commit."
+    echo "  <commit-or-tag-or-branch>: Sets up or updates the Wild KSU to specified tag, commit or branch."
     echo "  -h, --help:             Displays this usage information."
-    echo "  (no args):              Sets up or updates the Wild KSU environment to the latest tagged version."
+    echo "  (no args):              Sets up or updates the Wild KSU environment to default ($BRANCH_DEFAULT)."
 }
 
 initialize_variables() {
@@ -42,22 +43,20 @@ perform_cleanup() {
 
 # Sets up or update Wild KSU environment
 setup_kernelsu() {
-    echo "[+] Setting up $REPO..."
+    echo "[+] Setting up $REPO from $OWNER/$REPO..."
     test -d "$GKI_ROOT/$REPO" || git clone "https://github.com/$OWNER/$REPO" && echo "[+] Repository cloned."
     cd "$GKI_ROOT/$REPO"
     git stash && echo "[-] Stashed current changes."
 
-    BRANCH="$(git rev-parse --abbrev-ref origin/HEAD | sed 's@^origin/@@')"
-    if [ "$(git status | grep -Po 'v\d+(\.\d+)*' | head -n1)" ]; then
-        git checkout $BRANCH && echo "[-] Switched to $BRANCH branch."
+    git fetch origin
+    if [ -n "${1-}" ]; then
+        TARGET="$1"
+    else
+        TARGET="$BRANCH_DEFAULT"
     fi
 
-    git pull && echo "[+] Repository updated."
-    if [ -z "${1-}" ]; then
-        git checkout "$(git describe --abbrev=0 --tags)" && echo "[-] Checked out latest tag."
-    else
-        git checkout "$1" && echo "[-] Checked out $1." || echo "[-] Checkout default branch"
-    fi
+    echo "[-] Checking out $TARGET..."
+    git checkout "$TARGET" 2>/dev/null || git checkout -B "$TARGET" "origin/$TARGET" 2>/dev/null || git checkout "$(git describe --abbrev=0 --tags 2>/dev/null || echo HEAD)"
     cd "$DRIVER_DIR"
     ln -sf "$(realpath --relative-to="$DRIVER_DIR" "$GKI_ROOT/$REPO/kernel")" "kernelsu" && echo "[+] Symlink created."
 
