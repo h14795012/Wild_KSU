@@ -30,7 +30,6 @@ initialize_variables() {
     DRIVER_KCONFIG=$DRIVER_DIR/Kconfig
 }
 
-# Reverts modifications made by this script
 perform_cleanup() {
     echo "[+] Cleaning up..."
     [ -L "$DRIVER_DIR/kernelsu" ] && rm "$DRIVER_DIR/kernelsu" && echo "[-] Symlink removed."
@@ -41,7 +40,6 @@ perform_cleanup() {
     fi
 }
 
-# Sets up or update Wild KSU environment
 setup_kernelsu() {
     echo "[+] Setting up $REPO from $OWNER/$REPO..."
     test -d "$GKI_ROOT/$REPO" || git clone "https://github.com/$OWNER/$REPO" && echo "[+] Repository cloned."
@@ -55,18 +53,22 @@ setup_kernelsu() {
         TARGET="$BRANCH_DEFAULT"
     fi
 
-    echo "[-] Checking out $TARGET..."
-    git checkout "$TARGET" 2>/dev/null || git checkout -B "$TARGET" "origin/$TARGET" 2>/dev/null || git checkout "$(git describe --abbrev=0 --tags 2>/dev/null || echo HEAD)"
+    echo "[-] Checking out target: $TARGET..."
+    if ! git checkout "$TARGET" 2>/dev/null && ! git checkout -B "$TARGET" "origin/$TARGET" 2>/dev/null; then
+        echo "[ERROR] Failed to check out target: $TARGET. Refusing to fallback silently."
+        exit 1
+    fi
+    ACTUAL_SHA="$(git rev-parse HEAD)"
+    echo "[+] Successfully checked out commit: $ACTUAL_SHA"
+
     cd "$DRIVER_DIR"
     ln -sf "$(realpath --relative-to="$DRIVER_DIR" "$GKI_ROOT/$REPO/kernel")" "kernelsu" && echo "[+] Symlink created."
 
-    # Add entries in Makefile and Kconfig if not already existing
     grep -q "kernelsu" "$DRIVER_MAKEFILE" || printf "\nobj-\$(CONFIG_KSU) += kernelsu/\n" >> "$DRIVER_MAKEFILE" && echo "[+] Modified Makefile."
     grep -q "source \"drivers/kernelsu/Kconfig\"" "$DRIVER_KCONFIG" || sed -i "/endmenu/i\source \"drivers/kernelsu/Kconfig\"" "$DRIVER_KCONFIG" && echo "[+] Modified Kconfig."
     echo '[+] Done.'
 }
 
-# Process command-line arguments
 if [ "$#" -eq 0 ]; then
     initialize_variables
     setup_kernelsu
