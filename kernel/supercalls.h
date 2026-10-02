@@ -187,6 +187,47 @@ struct wksu_mem_ops_cmd {
     __u32 completed;
 };
 
+#define WKSU_MEM_OPS_VERSION_V2 2
+#define WKSU_MEM_OPS_FLAG_HOLD  0x00000001U
+
+struct wksu_mem_ops_cmd_v2 {
+    __u32 version;
+    __u32 size;
+    __s32 pid;
+    __u32 count;
+    __u64 ops;
+    __s32 first_error;
+    __u32 completed;
+    __u32 flags;
+    __u32 hold_tid;
+};
+
+#define KSU_THREAD_CTX_TLS     0x1
+#define KSU_THREAD_CTX_CPUCTX  0x2
+
+struct ksu_thread_ctx_cmd {
+    __s32 pid;
+    __s32 tid;           // 0 = thread group leader
+    __u32 mask;          // KSU_THREAD_CTX_*
+    __s32 result;
+    __u64 tp_value;      // TPIDR_EL0
+    __u64 tp2_value;
+    __u64 x[12];         // x19-x28, fp, reserved
+    __u64 sp;
+    __u64 pc;
+};
+
+struct ksu_regs_cmd {
+    __s32 pid;
+    __s32 tid;
+    __s32 result;
+    __u32 source;       // 0: user_regs safe-point snapshot, 1: saved regs
+    __u64 x[31];        // x0-x30
+    __u64 sp;
+    __u64 pc;
+    __u64 pstate;
+};
+
 struct ksu_find_pid_cmd {
     char process_name[256];
     __s32 pid;
@@ -393,6 +434,9 @@ struct ksu_process_signal_cmd {
 #define KSU_IOCTL_VOLUME_KEY_STATE _IOWR('K', 31, struct ksu_volume_key_state_cmd)
 #define KSU_IOCTL_TOUCH_READER _IOWR('K', 32, struct ksu_touch_reader_cmd)
 #define KSU_IOCTL_MEM_OPS_V1 _IOWR('K', 33, struct wksu_mem_ops_cmd)
+#define KSU_IOCTL_MEM_OPS_V2 _IOWR('K', 33, struct wksu_mem_ops_cmd_v2)
+#define KSU_IOCTL_GET_THREAD_CTX _IOWR('K', 34, struct ksu_thread_ctx_cmd)
+#define KSU_IOCTL_GET_REGS _IOWR('K', 37, struct ksu_regs_cmd)
 #define KSU_IOCTL_GET_HOOK_MODE _IOC(_IOC_READ, 'K', 98, 0)
 #define KSU_IOCTL_GET_VERSION_TAG _IOC(_IOC_READ, 'K', 99, 0)
 

@@ -40,6 +40,7 @@
 #endif // #ifdef CONFIG_KSU_SUSFS
 
 #include "supercalls.h"
+#include "wksu_freeze.h"
 #include "arch.h"
 #include "allowlist.h"
 #include "feature.h"
@@ -1175,6 +1176,253 @@ out_put_task:
     put_task_struct(task);
 out_free_ops:
     kfree(ops);
+    return ret;
+}
+
+static int do_mem_ops_v2(void __user *arg)
+{
+    struct wksu_mem_ops_cmd_v2 cmd;
+    struct wksu_mem_op *ops;
+    struct task_struct *task;
+    struct mm_struct *mm = NULL;
+    void *page_buf = NULL;
+    size_t ops_size;
+    __u32 completed = 0;
+    __u32 i;
+    int first_error = 0;
+    int ret = 0;
+
+    BUILD_BUG_ON(sizeof(struct wksu_mem_ops_cmd_v2) != 40);
+    BUILD_BUG_ON(offsetof(struct wksu_mem_ops_cmd_v2, flags) != 32);
+    BUILD_BUG_ON(offsetof(struct wksu_mem_ops_cmd_v2, hold_tid) != 36);
+    BUILD_BUG_ON(_IOC_TYPE(KSU_IOCTL_MEM_OPS_V2) != 'K');
+    BUILD_BUG_ON(_IOC_NR(KSU_IOCTL_MEM_OPS_V2) != 33);
+    BUILD_BUG_ON(_IOC_SIZE(KSU_IOCTL_MEM_OPS_V2) != sizeof(cmd));
+
+    if (copy_from_user(&cmd, arg, sizeof(cmd)))
+        return -EFAULT;
+
+    if (cmd.version != WKSU_MEM_OPS_VERSION_V2 || cmd.size != sizeof(cmd) ||
+        cmd.pid <= 0 || !cmd.ops || !cmd.count ||
+        cmd.count > WKSU_MEM_OP_MAX_COUNT)
+        return -EINVAL;
+
+    if (cmd.flags & ~WKSU_MEM_OPS_FLAG_HOLD)
+        return -EINVAL;
+
+    if (!wksu_is_pid_hidden(task_tgid_vnr(current)))
+        return -EACCES;
+
+    if (check_mul_overflow((size_t)cmd.count, sizeof(*ops), &ops_size))
+        return -EOVERFLOW;
+
+    ops = memdup_user((void __user *)(unsigned long)cmd.ops, ops_size);
+    if (IS_ERR(ops))
+        return PTR_ERR(ops);
+
+    if (cmd.hold_tid != 0) {
+        task = find_get_task_by_vpid(cmd.hold_tid);
+        if (!task || task_tgid_vnr(task) != cmd.pid) {
+            if (task)
+                put_task_struct(task);
+            ret = -ESRCH;
+            goto out_free_ops;
+        }
+    } else {
+        task = find_get_task_by_vpid(cmd.pid);
+        if (!task) {
+            ret = -ESRCH;
+            goto out_free_ops;
+        }
+    }
+
+    if (cmd.flags & WKSU_MEM_OPS_FLAG_HOLD) {
+        struct wksu_hold_field fields[WKSU_HOLD_MAX_FIELDS];
+        struct wksu_hold_snapshot snapshot;
+        __u32 hold_count = min_t(__u32, cmd.count, WKSU_HOLD_MAX_FIELDS);
+
+        mm = get_task_mm(task);
+        if (!mm) {
+            ret = -ESRCH;
+            goto out_put_task;
+        }
+
+        for (i = 0; i < hold_count; i++) {
+            if (ops[i].op != WKSU_MEM_OP_READ_ABS || ops[i].len > WKSU_HOLD_FIELD_SIZE) {
+                ret = -EINVAL;
+                goto out_put_mm;
+            }
+            fields[i].addr = ops[i].addr;
+            fields[i].len = ops[i].len;
+        }
+
+        ret = wksu_capture_consistent_snapshot(task, mm, fields, hold_count, &snapshot, 2000, 200);
+        if (ret == 0) {
+            for (i = 0; i < hold_count; i++) {
+                if (copy_to_user((void __user *)(unsigned long)ops[i].buf,
+                                 snapshot.data[i], ops[i].len)) {
+                    ops[i].status = -EFAULT;
+                    ops[i].done = 0;
+                    if (!first_error)
+                        first_error = -EFAULT;
+                } else {
+                    ops[i].status = 0;
+                    ops[i].done = ops[i].len;
+                    completed++;
+                }
+            }
+        } else {
+            first_error = ret;
+        }
+
+out_put_mm:
+        mmput(mm);
+    } else {
+        page_buf = (void *)__get_free_page(GFP_KERNEL);
+        if (!page_buf) {
+            ret = -ENOMEM;
+            goto out_put_task;
+        }
+
+        for (i = 0; i < cmd.count; i++) {
+            int op_ret = wksu_execute_mem_op(task, &ops[i], page_buf);
+
+            if (!op_ret)
+                completed++;
+            else if (!first_error)
+                first_error = op_ret;
+            cond_resched();
+        }
+
+        free_page((unsigned long)page_buf);
+    }
+
+    cmd.first_error = first_error;
+    cmd.completed = completed;
+
+    if (copy_to_user((void __user *)(unsigned long)cmd.ops, ops, ops_size) ||
+        copy_to_user(arg, &cmd, sizeof(cmd)))
+        ret = -EFAULT;
+
+out_put_task:
+    put_task_struct(task);
+out_free_ops:
+    kfree(ops);
+    return ret;
+}
+
+static int do_get_thread_ctx(void __user *arg)
+{
+    struct ksu_thread_ctx_cmd cmd;
+    struct task_struct *task;
+    pid_t query_tid;
+    int ret = 0;
+
+    BUILD_BUG_ON(sizeof(struct ksu_thread_ctx_cmd) != 144);
+    BUILD_BUG_ON(_IOC_TYPE(KSU_IOCTL_GET_THREAD_CTX) != 'K');
+    BUILD_BUG_ON(_IOC_NR(KSU_IOCTL_GET_THREAD_CTX) != 34);
+
+    if (copy_from_user(&cmd, arg, sizeof(cmd)))
+        return -EFAULT;
+
+    if (!wksu_is_pid_hidden(task_tgid_vnr(current)))
+        return -EACCES;
+
+    query_tid = cmd.tid ? cmd.tid : cmd.pid;
+    if (query_tid <= 0)
+        return -EINVAL;
+
+    task = find_get_task_by_vpid(query_tid);
+    if (!task || (cmd.pid > 0 && task_tgid_vnr(task) != cmd.pid)) {
+        if (task)
+            put_task_struct(task);
+        return -ESRCH;
+    }
+
+    cmd.result = 0;
+
+#if defined(__aarch64__)
+    if (cmd.mask & KSU_THREAD_CTX_TLS) {
+        cmd.tp_value = (uint64_t)*task_user_tls(task);
+        cmd.tp2_value = (uint64_t)task->thread.uw.tp2_value;
+    }
+
+    if (cmd.mask & KSU_THREAD_CTX_CPUCTX) {
+        cmd.x[0] = task->thread.cpu_context.x19;
+        cmd.x[1] = task->thread.cpu_context.x20;
+        cmd.x[2] = task->thread.cpu_context.x21;
+        cmd.x[3] = task->thread.cpu_context.x22;
+        cmd.x[4] = task->thread.cpu_context.x23;
+        cmd.x[5] = task->thread.cpu_context.x24;
+        cmd.x[6] = task->thread.cpu_context.x25;
+        cmd.x[7] = task->thread.cpu_context.x26;
+        cmd.x[8] = task->thread.cpu_context.x27;
+        cmd.x[9] = task->thread.cpu_context.x28;
+        cmd.x[10] = task->thread.cpu_context.fp;
+        cmd.x[11] = 0;
+        cmd.sp = task->thread.cpu_context.sp;
+        cmd.pc = task->thread.cpu_context.pc;
+    }
+#else
+    cmd.result = -EOPNOTSUPP;
+#endif
+
+    if (copy_to_user(arg, &cmd, sizeof(cmd)))
+        ret = -EFAULT;
+
+    put_task_struct(task);
+    return ret;
+}
+
+static int do_get_regs(void __user *arg)
+{
+    struct ksu_regs_cmd cmd;
+    struct task_struct *task;
+    struct pt_regs *regs;
+    pid_t query_tid;
+    int ret = 0;
+
+    BUILD_BUG_ON(sizeof(struct ksu_regs_cmd) != 288);
+    BUILD_BUG_ON(_IOC_TYPE(KSU_IOCTL_GET_REGS) != 'K');
+    BUILD_BUG_ON(_IOC_NR(KSU_IOCTL_GET_REGS) != 37);
+
+    if (copy_from_user(&cmd, arg, sizeof(cmd)))
+        return -EFAULT;
+
+    if (!wksu_is_pid_hidden(task_tgid_vnr(current)))
+        return -EACCES;
+
+    query_tid = cmd.tid ? cmd.tid : cmd.pid;
+    if (query_tid <= 0)
+        return -EINVAL;
+
+    task = find_get_task_by_vpid(query_tid);
+    if (!task || (cmd.pid > 0 && task_tgid_vnr(task) != cmd.pid)) {
+        if (task)
+            put_task_struct(task);
+        return -ESRCH;
+    }
+
+#if defined(__aarch64__)
+    regs = task_pt_regs(task);
+    if (regs) {
+        memcpy(cmd.x, regs->user_regs.regs, sizeof(cmd.x));
+        cmd.sp = regs->user_regs.sp;
+        cmd.pc = regs->user_regs.pc;
+        cmd.pstate = regs->user_regs.pstate;
+        cmd.source = user_mode(regs) ? 0 : 1;
+        cmd.result = 0;
+    } else {
+        cmd.result = -ENOENT;
+    }
+#else
+    cmd.result = -EOPNOTSUPP;
+#endif
+
+    if (copy_to_user(arg, &cmd, sizeof(cmd)))
+        ret = -EFAULT;
+
+    put_task_struct(task);
     return ret;
 }
 
@@ -2807,6 +3055,18 @@ static const struct ksu_ioctl_cmd_map ksu_ioctl_handlers[] = {
     { .cmd = KSU_IOCTL_MEM_OPS_V1,
       .name = "MEM_OPS_V1",
       .handler = do_mem_ops,
+      .perm_check = manager_or_root },
+    { .cmd = KSU_IOCTL_MEM_OPS_V2,
+      .name = "MEM_OPS_V2",
+      .handler = do_mem_ops_v2,
+      .perm_check = manager_or_root },
+    { .cmd = KSU_IOCTL_GET_THREAD_CTX,
+      .name = "GET_THREAD_CTX",
+      .handler = do_get_thread_ctx,
+      .perm_check = manager_or_root },
+    { .cmd = KSU_IOCTL_GET_REGS,
+      .name = "GET_REGS",
+      .handler = do_get_regs,
       .perm_check = manager_or_root },
     { .cmd = KSU_IOCTL_GET_HOOK_MODE,
       .name = "GET_HOOK_MODE",
