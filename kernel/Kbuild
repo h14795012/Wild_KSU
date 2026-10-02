@@ -20,8 +20,7 @@ kernelsu-objs += seccomp_cache.o
 kernelsu-objs += file_wrapper.o
 kernelsu-objs += util.o
 kernelsu-objs += extras.o
-
-kernelsu-objs += extras.o
+kernelsu-objs += susfs_compat.o
 
 kernelsu-objs += selinux/selinux.o
 kernelsu-objs += selinux/sepolicy.o
