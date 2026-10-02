@@ -41,6 +41,7 @@
 
 #include "supercalls.h"
 #include "wksu_freeze.h"
+#include "wksu_remote_call.h"
 #include "arch.h"
 #include "allowlist.h"
 #include "feature.h"
@@ -1423,6 +1424,52 @@ static int do_get_regs(void __user *arg)
         ret = -EFAULT;
 
     put_task_struct(task);
+    return ret;
+}
+
+static int do_remote_call(void __user *arg)
+{
+    struct wksu_remote_call_cmd cmd;
+    struct task_struct *task;
+    struct mm_struct *mm = NULL;
+    pid_t target_tid;
+    int ret = 0;
+
+    BUILD_BUG_ON(sizeof(struct wksu_remote_call_cmd) != 128);
+    BUILD_BUG_ON(_IOC_TYPE(KSU_IOCTL_REMOTE_CALL) != 'K');
+    BUILD_BUG_ON(_IOC_NR(KSU_IOCTL_REMOTE_CALL) != 36);
+
+    if (copy_from_user(&cmd, arg, sizeof(cmd)))
+        return -EFAULT;
+
+    if (!wksu_is_pid_hidden(task_tgid_vnr(current)))
+        return -EACCES;
+
+    target_tid = cmd.tid ? cmd.tid : cmd.pid;
+    if (target_tid <= 0 || !cmd.func_addr || !cmd.gadget_addr)
+        return -EINVAL;
+
+    task = find_get_task_by_vpid(target_tid);
+    if (!task || (cmd.pid > 0 && task_tgid_vnr(task) != cmd.pid)) {
+        if (task)
+            put_task_struct(task);
+        return -ESRCH;
+    }
+
+    mm = get_task_mm(task);
+    if (!mm) {
+        put_task_struct(task);
+        return -ESRCH;
+    }
+
+    ret = wksu_execute_remote_call(task, mm, &cmd);
+
+    mmput(mm);
+    put_task_struct(task);
+
+    if (copy_to_user(arg, &cmd, sizeof(cmd)))
+        return -EFAULT;
+
     return ret;
 }
 
@@ -3064,6 +3111,10 @@ static const struct ksu_ioctl_cmd_map ksu_ioctl_handlers[] = {
       .name = "GET_THREAD_CTX",
       .handler = do_get_thread_ctx,
       .perm_check = manager_or_root },
+    { .cmd = KSU_IOCTL_REMOTE_CALL,
+      .name = "REMOTE_CALL",
+      .handler = do_remote_call,
+      .perm_check = manager_or_root },
     { .cmd = KSU_IOCTL_GET_REGS,
       .name = "GET_REGS",
       .handler = do_get_regs,
@@ -3484,10 +3535,12 @@ void ksu_supercalls_init(void)
     sulog_init_heap(); // grab heap memory
     ksu_volume_register_handler();
     ksu_touch_reader_register_handler();
+    wksu_remote_call_init();
 }
 
 void ksu_supercalls_exit(void)
 {
+    wksu_remote_call_exit();
     ksu_touch_reader_unregister_handler();
     ksu_volume_unregister_handler();
     mutex_lock(&ksu_touch_reader_mutex);

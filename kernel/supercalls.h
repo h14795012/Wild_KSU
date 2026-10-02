@@ -228,6 +228,31 @@ struct ksu_regs_cmd {
     __u64 pstate;
 };
 
+enum wksu_rc_status {
+    WKSU_RC_SUCCESS         = 0,
+    WKSU_RC_ERR_TIMEOUT     = 1,
+    WKSU_RC_ERR_FAULT       = 2,    /* Target faulted, safely intercepted and restored */
+    WKSU_RC_ERR_BUSY        = 3,    /* Target thread busy or uninjectable */
+    WKSU_RC_ERR_INVALID     = 4,
+};
+
+#define WKSU_RC_FLAG_CUSTOM_GADGET  0x00000001U
+#define WKSU_RC_FLAG_COOPERATIVE    0x00000002U
+
+struct wksu_remote_call_cmd {
+    __s32 pid;
+    __s32 tid;               /* Target thread TID (e.g. GameThread) */
+    __u64 func_addr;         /* Absolute address in user space */
+    __u64 args[8];           /* In: X0 - X7 */
+    __u64 ret_x0;            /* Out: return value from function */
+    __u32 timeout_ms;        /* In: execution deadline in ms (e.g. 50ms) */
+    __s32 status;            /* Out: enum wksu_rc_status */
+    __u64 gadget_addr;       /* In: user-space trampoline / gadget address */
+    __u32 flags;             /* In: WKSU_RC_FLAG_* */
+    __u32 reserved1;
+    __u64 reserved2[2];
+};
+
 struct ksu_find_pid_cmd {
     char process_name[256];
     __s32 pid;
@@ -436,6 +461,7 @@ struct ksu_process_signal_cmd {
 #define KSU_IOCTL_MEM_OPS_V1 _IOWR('K', 33, struct wksu_mem_ops_cmd)
 #define KSU_IOCTL_MEM_OPS_V2 _IOWR('K', 33, struct wksu_mem_ops_cmd_v2)
 #define KSU_IOCTL_GET_THREAD_CTX _IOWR('K', 34, struct ksu_thread_ctx_cmd)
+#define KSU_IOCTL_REMOTE_CALL _IOWR('K', 36, struct wksu_remote_call_cmd)
 #define KSU_IOCTL_GET_REGS _IOWR('K', 37, struct ksu_regs_cmd)
 #define KSU_IOCTL_GET_HOOK_MODE _IOC(_IOC_READ, 'K', 98, 0)
 #define KSU_IOCTL_GET_VERSION_TAG _IOC(_IOC_READ, 'K', 99, 0)
